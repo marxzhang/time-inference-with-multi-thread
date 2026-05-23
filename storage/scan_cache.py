@@ -37,6 +37,7 @@ Value 设计
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -85,6 +86,7 @@ class ScanCache:
         self._store: dict[str, dict[str, Any]] = {}  # key → item_dict
         self._dirty: list[tuple[str, dict]] = []      # 待写盘的条目
         self._loaded = False
+        self._lock = threading.Lock()  # 保护 _store / _dirty 和文件写入
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -127,10 +129,10 @@ class ScanCache:
         item_dict 会被过滤，只保留 _CACHED_FIELDS。
         """
         key = _make_key(relpath, filesize, mtime)
-        # 只缓存稳定字段，不缓存每次重新生成的字段
         filtered = {k: v for k, v in item_dict.items() if k in _CACHED_FIELDS}
-        self._store[key] = filtered
-        self._dirty.append((key, filtered))
+        with self._lock:
+            self._store[key] = filtered
+            self._dirty.append((key, filtered))
 
     def flush(self, compact_threshold: int = 5000) -> int:
         """
@@ -138,24 +140,24 @@ class ScanCache:
         dirty 条目超过 compact_threshold 时自动压缩去重。
         返回写入的条目数。
         """
-        if not self._dirty:
-            return 0
+        with self._lock:
+            if not self._dirty:
+                return 0
+            to_write = self._dirty[:]
+            self._dirty.clear()
+            store_size = len(self._store)
 
         with open(self._path, "a", encoding="utf-8") as f:
-            for key, value in self._dirty:
+            for key, value in to_write:
                 f.write(
                     json.dumps({"key": key, "value": value}, ensure_ascii=False)
                     + "\n"
                 )
 
-        count = len(self._dirty)
-        self._dirty.clear()
-
-        # 自动压缩：文件条目过多时去重重写
-        if len(self._store) > compact_threshold:
+        if store_size > compact_threshold:
             self.compact()
 
-        return count
+        return len(to_write)
 
     def compact(self) -> int:
         """

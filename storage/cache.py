@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -77,6 +78,11 @@ class Cache:
         # namespace → {sha1: value} 的内存 dict
         # 懒加载：第一次访问某 namespace 时才读文件
         self._store: dict[str, dict[str, Any]] = {}
+        # namespace → Lock，set() 和 _ensure_loaded() 时保护
+        # 读操作（get/has）不加锁：Python dict 读是原子的，
+        # preload() 已在处理前完成，并发读不会有竞态
+        self._locks: dict[str, threading.Lock] = {}
+        self._meta_lock = threading.Lock()  # 保护 _locks 和 _store 的创建
 
     # ------------------------------------------------------------------
     # 核心接口
@@ -85,34 +91,26 @@ class Cache:
     def get(self, namespace: str, sha1: str) -> Optional[Any]:
         """
         读取缓存值。未命中返回 None。
-
-        参数
-        ----
-        namespace : 缓存类型，如 "clip" / "ocr" / "phash"
-        sha1      : 图片内容的 SHA-1 哈希
+        preload() 之后并发读是安全的（Python dict 读原子性）。
         """
         self._ensure_loaded(namespace)
         return self._store[namespace].get(sha1)
 
     def set(self, namespace: str, sha1: str, value: Any) -> None:
         """
-        写入缓存值，同时追加到磁盘文件。
-
-        参数
-        ----
-        value : 任意 JSON-serializable 对象
-                （list、dict、str、float、int、None）
+        写入缓存值，同时追加到磁盘文件。线程安全。
+        每个 namespace 独立锁，不同 namespace 的写入互不阻塞。
         """
-        self._ensure_loaded(namespace)
-        self._store[namespace][sha1] = value
-
-        # append-only 写磁盘
-        record = json.dumps({"key": sha1, "value": value}, ensure_ascii=False)
-        with open(self._namespace_path(namespace), "a", encoding="utf-8") as f:
-            f.write(record + "\n")
+        lock = self._get_lock(namespace)
+        with lock:
+            self._ensure_loaded(namespace)
+            self._store[namespace][sha1] = value
+            record = json.dumps({"key": sha1, "value": value}, ensure_ascii=False)
+            with open(self._namespace_path(namespace), "a", encoding="utf-8") as f:
+                f.write(record + "\n")
 
     def has(self, namespace: str, sha1: str) -> bool:
-        """key 是否已缓存。"""
+        """key 是否已缓存。preload() 之后并发读安全。"""
         self._ensure_loaded(namespace)
         return sha1 in self._store[namespace]
 
@@ -204,8 +202,15 @@ class Cache:
     def _namespace_path(self, namespace: str) -> Path:
         return self._dir / f"{namespace}.jsonl"
 
+    def _get_lock(self, namespace: str) -> threading.Lock:
+        """获取 namespace 对应的锁，不存在则创建。"""
+        with self._meta_lock:
+            if namespace not in self._locks:
+                self._locks[namespace] = threading.Lock()
+            return self._locks[namespace]
+
     def _ensure_loaded(self, namespace: str) -> None:
-        """懒加载：首次访问时才读磁盘。"""
+        """懒加载：首次访问时才读磁盘。非线程安全，调用方需持锁或保证单线程。"""
         if namespace not in self._store:
             self._load(namespace)
 

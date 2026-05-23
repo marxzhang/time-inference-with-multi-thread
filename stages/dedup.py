@@ -156,24 +156,34 @@ class DedupStage(BatchStage):
         对 sha1 不同但 phash 相近的组，用并查集合并。
         复杂度 O(n²)，n < 1 万时可接受。
         """
-        # 每个 sha1 组选一个代表（phash 非空的）
-        rep_by_key: dict[str, "Item"] = {}
+        # 收集每个 group 的代表 key 和 phash 代表 item
+        # UnionFind 必须包含所有 group 的 key（含无 phash 的），否则 find() KeyError
+        all_keys: list[str] = []
+        rep_by_key: dict[str, "Item"] = {}  # 只有有 phash 的才进这里
+
         for gid, group in groups.items():
-            rep = next((it for it in group if it.phash), None)
-            if rep:
-                key = rep.sha1 or f"nosha1_{rep.id}"
-                rep_by_key[key] = rep
+            rep_with_phash = next((it for it in group if it.phash), None)
+            if rep_with_phash:
+                key = rep_with_phash.sha1 or f"nosha1_{rep_with_phash.id}"
+            else:
+                # 无 phash：用第一个 item 的 key，不参与 phash 比较
+                key = group[0].sha1 or f"nosha1_{group[0].id}"
+
+            all_keys.append(key)
+            if rep_with_phash:
+                rep_by_key[key] = rep_with_phash
 
         if len(rep_by_key) < 2:
             return groups
 
-        uf = _UnionFind(list(rep_by_key.keys()))
+        # 用全部 key 初始化，保证 find() 不会 KeyError
+        uf = _UnionFind(all_keys)
         merged = 0
 
-        keys = list(rep_by_key.keys())
-        for i in range(len(keys)):
-            for j in range(i + 1, len(keys)):
-                ka, kb = keys[i], keys[j]
+        phash_keys = list(rep_by_key.keys())
+        for i in range(len(phash_keys)):
+            for j in range(i + 1, len(phash_keys)):
+                ka, kb = phash_keys[i], phash_keys[j]
                 pa = rep_by_key[ka].phash
                 pb = rep_by_key[kb].phash
                 if pa and pb and _hamming_distance(pa, pb) <= self.phash_threshold:
@@ -185,8 +195,11 @@ class DedupStage(BatchStage):
 
         new_groups: dict[str, list["Item"]] = defaultdict(list)
         for gid, group in groups.items():
-            rep = next((it for it in group if it.phash), group[0])
-            key = rep.sha1 or f"nosha1_{rep.id}"
+            rep_with_phash = next((it for it in group if it.phash), None)
+            if rep_with_phash:
+                key = rep_with_phash.sha1 or f"nosha1_{rep_with_phash.id}"
+            else:
+                key = group[0].sha1 or f"nosha1_{group[0].id}"
             new_groups[uf.find(key)].extend(group)
 
         ctx.logger.debug(f"[{self.name}] phash merged {merged} pair(s)")
@@ -351,6 +364,10 @@ class _UnionFind:
         self._rank   = {e: 0  for e in elements}
 
     def find(self, x) -> str:
+        if x not in self._parent:
+            # 未知 key：自动注册为自身根节点（防御性兜底）
+            self._parent[x] = x
+            self._rank[x]   = 0
         if self._parent[x] != x:
             self._parent[x] = self.find(self._parent[x])
         return self._parent[x]

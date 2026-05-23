@@ -50,7 +50,9 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -77,11 +79,10 @@ class ExportWriter:
     def __init__(self, export_dir: str, input_dir: str = "") -> None:
         self.export_dir = Path(export_dir)
         self.input_dir  = input_dir
-        # plan 文件路径与 planner 保持一致的命名规则
-        # 不重新生成时间戳（plan/write 是两次独立运行）
-        # 始终找目录下最新的 *_plan.jsonl
         candidates = sorted(self.export_dir.glob("*_plan.jsonl"))
         self.plan_path = candidates[-1] if candidates else self.export_dir / "export_plan.jsonl"
+        # 保护 plan 文件的追加写入（_update_status 在多线程中调用）
+        self._plan_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 主入口
@@ -115,13 +116,29 @@ class ExportWriter:
             ctx.logger.info("[ExportWriter] nothing to do, all actions completed")
             return
 
+        workers = getattr(ctx.config, "max_workers", 1)
         t0 = time.monotonic()
         counts = {"done": 0, "skipped": 0, "failed": 0}
+        counts_lock = threading.Lock()
 
-        for action in pending:
+        def _run_one(action: ExportAction) -> None:
             result = self._execute(action, ctx)
             self._update_status(action, result, ctx)
-            counts[action.status if action.status in counts else "done"] += 1
+            key = action.status if action.status in counts else "done"
+            with counts_lock:
+                counts[key] += 1
+
+        if workers <= 1:
+            for action in pending:
+                _run_one(action)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_run_one, a) for a in pending]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        ctx.logger.error(f"[ExportWriter] unexpected error: {e}")
 
         elapsed = time.monotonic() - t0
         ctx.logger.info(
@@ -424,8 +441,9 @@ class ExportWriter:
             )
 
         try:
-            with open(self.plan_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(action.to_dict(), ensure_ascii=False) + "\n")
+            with self._plan_lock:
+                with open(self.plan_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(action.to_dict(), ensure_ascii=False) + "\n")
         except Exception as e:
             ctx.logger.error(f"[ExportWriter] failed to update plan: {e}")
 

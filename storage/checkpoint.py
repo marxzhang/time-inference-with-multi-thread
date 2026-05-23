@@ -37,6 +37,7 @@ storage/checkpoint.py — 运行状态缓存（pipeline 级，断点续传）
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -85,6 +86,8 @@ class Checkpoint:
         # 待写盘的 item 队列
         self._pending: list["Item"] = []
         self._done_count: int = 0
+        # 保护 _pending / _done_count 和文件写入
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 断点恢复
@@ -123,44 +126,43 @@ class Checkpoint:
 
     def on_item_done(self, item: "Item") -> None:
         """
-        每个 item 处理完后调用。
+        每个 item 处理完后调用。线程安全。
         达到 save_interval 时自动批量写盘。
         """
-        self._pending.append(item)
-        self._done_count += 1
+        with self._lock:
+            self._pending.append(item)
+            self._done_count += 1
+            should_flush = len(self._pending) >= self.save_interval
 
-        if len(self._pending) >= self.save_interval:
+        if should_flush:
             self.flush()
 
     def flush(self) -> int:
         """
-        把所有待写盘的 item 写入 checkpoint 文件。
+        把所有待写盘的 item 写入 checkpoint 文件。线程安全。
         返回成功写入的条目数。
-
-        逐条写入并捕获异常：单条序列化失败不影响其他 item，
-        失败的 item 会被跳过（下次运行时重新处理该 item，代价可接受）。
         """
-        if not self._pending:
-            return 0
+        with self._lock:
+            if not self._pending:
+                return 0
+            # 取走当前 pending，立即释放锁，让其他线程继续 on_item_done
+            to_write = self._pending[:]
+            self._pending.clear()
 
         count = 0
         with open(self._path, "a", encoding="utf-8") as f:
-            for item in self._pending:
+            for item in to_write:
                 try:
                     record = json.dumps(item.to_dict(), ensure_ascii=False)
                     f.write(record + "\n")
                     count += 1
                 except (TypeError, ValueError) as e:
-                    # 序列化失败：跳过该 item，不中断整体流程
-                    # 该 item 下次运行时会被重新处理
                     import warnings
                     warnings.warn(
                         f"[Checkpoint] failed to serialize item "
                         f"{getattr(item, 'filename', '?')!r}: {e}",
                         stacklevel=2,
                     )
-
-        self._pending.clear()
         return count
 
     # ------------------------------------------------------------------
