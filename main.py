@@ -25,7 +25,14 @@ import argparse
 import json
 import sys
 import time
+import warnings
 from pathlib import Path
+
+# pillow_heif 在处理 HEIC 文件时内部创建 TemporaryDirectory 但未显式 cleanup，
+# 进程退出时 GC 会发出 ResourceWarning。文件已处理完毕，临时目录由 OS 回收，无害。
+warnings.filterwarnings(
+    "ignore", category=ResourceWarning, message=".*TemporaryDirectory.*"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +46,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "input_dir",
-        help="扫描的根目录",
+        nargs="?",
+        default="",
+        help=(
+            "扫描的根目录。"
+            "仅运行 --export-write 时可省略（直接读已有 plan 文件）。"
+        ),
     )
     parser.add_argument(
         "--output", "-o",
@@ -155,6 +167,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="执行 export_plan.jsonl 中的文件操作（需先运行 --export-plan）",
     )
+    parser.add_argument(
+        "--write-only",
+        action="store_true",
+        help=(
+            "只运行 ExportWriter，跳过 scan / pipeline / planner。"
+            "等价于：不传 input_dir，只传 --export-write --export-dir。"
+            "input_dir 可以省略。"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -165,6 +186,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """返回 exit code：0 成功，1 失败。"""
     args = parse_args()
+
+    # ── write-only 快速路径 ───────────────────────────────────────────
+    # 只运行 ExportWriter，跳过 scan / pipeline / planner。
+    # 触发条件：--write-only，或 --export-write 且未提供 input_dir。
+    if args.write_only or (args.export_write and not args.input_dir):
+        return _main_write_only(args)
+
+    # input_dir 在非 write-only 模式下是必填的
+    if not args.input_dir:
+        print("error: input_dir is required unless using --write-only or --export-write without input_dir", file=sys.stderr)
+        return 1
 
     # ── 1. Config ─────────────────────────────────────────────────────
     from config import Config
@@ -311,6 +343,50 @@ def _run_writer(export_dir: str, ctx) -> None:
     from export.planner import ExportPlanner
     writer = ExportWriter(export_dir, input_dir=ctx.config.input_dir)
     writer.run(ctx)
+
+
+def _main_write_only(args) -> int:
+    """
+    write-only 模式：只运行 ExportWriter，不做任何 scan / pipeline。
+
+    只需要两个参数：
+        --export-dir  : plan 文件所在目录（必填）
+        --log-level   : 可选
+
+    input_dir 会从 plan 文件名中解析（格式：TIMESTAMP_FOLDERNAME_plan.jsonl），
+    仅用于 writer 的安全检查，不实际扫描目录。
+    """
+    import logging
+    import sys as _sys
+
+    if not args.export_dir:
+        print("error: --export-write / --write-only requires --export-dir",
+              file=_sys.stderr)
+        return 1
+
+    # 从 plan 文件名推断 input_dir（仅供日志和安全检查，可为空）
+    from pathlib import Path
+    export_path = Path(args.export_dir)
+    input_dir = args.input_dir or ""
+
+    # ctx 构建后用 ctx.logger，这里先占位，构建 ctx 后再打日志
+
+    from config import Config
+    from core.context import Context
+    cfg = Config(
+        input_dir=input_dir,
+        dry_run=getattr(args, "dry_run", False),
+        max_workers=getattr(args, "workers", 1),
+        log_level=args.log_level,
+        cache_dir=getattr(args, "cache_dir", ".cache"),
+    )
+    ctx = Context(cfg)
+    ctx.logger.info(f"[write-only] export_dir: {args.export_dir}")
+    if input_dir:
+        ctx.logger.info(f"[write-only] input_dir : {input_dir}")
+
+    _run_writer(args.export_dir, ctx)
+    return 0
 
 
 def _dump_json(items: list, path: str, ctx) -> None:

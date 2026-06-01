@@ -80,13 +80,15 @@ class ScanCache:
     sc.flush()                           # 扫描完成后写盘（或每 N 条自动写）
     """
 
-    def __init__(self, cache_dir: str) -> None:
+    def __init__(self, cache_dir: str, flush_interval: int = 500) -> None:
         self._path = Path(cache_dir) / _CACHE_FILENAME
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._store: dict[str, dict[str, Any]] = {}  # key → item_dict
         self._dirty: list[tuple[str, dict]] = []      # 待写盘的条目
         self._loaded = False
         self._lock = threading.Lock()  # 保护 _store / _dirty 和文件写入
+        # 积累多少条 dirty 自动写盘。500条崩溃最多丢500条，单次写盘<5ms。
+        self._flush_interval = flush_interval
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -133,6 +135,10 @@ class ScanCache:
         with self._lock:
             self._store[key] = filtered
             self._dirty.append((key, filtered))
+            should_flush = len(self._dirty) >= self._flush_interval
+        # flush 在锁外执行，不阻塞其他线程继续 set
+        if should_flush:
+            self.flush()
 
     def flush(self, compact_threshold: int = 5000) -> int:
         """

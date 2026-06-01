@@ -107,7 +107,6 @@ class ResolverStage(Stage):
 
         if conflicts:
             item.add_flag("CONFLICT_TIME")
-            item.add_flag("NEEDS_REVIEW")
             for c_ev, delta in conflicts:
                 item.warn(
                     self.name,

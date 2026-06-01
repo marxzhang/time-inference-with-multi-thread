@@ -59,7 +59,7 @@ class Config:
     # 性能
     # ------------------------------------------------------------------
 
-    max_workers: int = 4
+    max_workers: int = 32
     """并发线程数。"""
 
     batch_size: int = 64

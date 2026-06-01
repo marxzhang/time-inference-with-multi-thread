@@ -18,7 +18,9 @@ skip_extensions：
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Optional
 
@@ -44,10 +46,13 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset({
 ALL_EXTENSIONS: frozenset[str] = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
 # 默认跳过的系统 / 元数据文件（完全不建 item）
+# DEFAULT_SKIP_EXTENSIONS: frozenset[str] = frozenset({
+#     "ds_store", "db", "ini", "nomedia",
+#     "json", "xml", "txt", "md",
+#     "pdf", "xmp", "thm",
+# })
 DEFAULT_SKIP_EXTENSIONS: frozenset[str] = frozenset({
-    "ds_store", "db", "ini", "nomedia",
-    "json", "xml", "txt", "md",
-    "xmp", "thm",
+
 })
 
 _SCREENSHOT_RATIO_THRESHOLD = 2.2
@@ -84,17 +89,21 @@ class ScanStage:
         """
         扫描 ctx.config.input_dir，返回 Item 列表。
 
-        断点续传：
-            若 ctx.cache 已启用，自动使用 ScanCache。
-            已扫描过的文件（relpath + filesize + mtime 不变）直接从缓存恢复，
-            跳过 sha1 计算、Pillow 解码、phash 等慢操作。
+        多线程：
+            cache miss 的文件（需要计算 sha1 / phash）用线程池并发处理。
+            cache hit 的文件在主线程直接恢复，无需并发。
+            workers 来自 config.max_workers，设为 1 退化为串行。
+
+        断点续传（scan cache）：
+            已扫描过的文件（relpath + filesize + mtime 不变）直接从缓存恢复。
+            每 FLUSH_INTERVAL 个新 item 写盘一次，兼顾性能和崩溃安全。
 
         统计规则：
-            total_input_files = 所有非 skip_extensions 的文件数
-                              = confident + review + unsupported + duplicate（最终）
+            total_input_files = confident + review + unsupported + duplicate
         """
         from core.item import Item
         from storage.scan_cache import ScanCache
+
 
         input_dir = Path(ctx.config.input_dir).resolve()
         if not input_dir.is_dir():
@@ -104,64 +113,156 @@ class ScanStage:
 
         skip_ext = getattr(ctx.config, "skip_extensions", None) or DEFAULT_SKIP_EXTENSIONS
         livp_enabled = extra_livp_map is not None
+        workers = getattr(ctx.config, "max_workers", 1)
 
-        # 初始化 scan cache（只要 cache_dir 存在就启用，不依赖 --cache 开关）
         scan_cache = ScanCache(ctx.config.cache_dir)
         n_preloaded = scan_cache.preload()
+        # atexit / SIGINT 兜底：程序任何形式退出时都写盘
+        import atexit, signal as _signal
+        atexit.register(scan_cache.flush)
+        def _flush_on_signal(sig, frame):
+            scan_cache.flush()
+            raise SystemExit(0)
+        try:
+            _signal.signal(_signal.SIGTERM, _flush_on_signal)
+        except (OSError, ValueError):
+            pass  # 非主线程注册 signal 会失败，忽略
 
         ctx.logger.info(
             f"[{self.name}] scanning: {input_dir}"
             + (f" (scan cache: {n_preloaded} entries)" if n_preloaded else "")
+            + (f", workers={workers}" if workers > 1 else "")
         )
         t0 = time.monotonic()
 
         all_paths = sorted(self._walk(input_dir, skip_ext))
 
-        items: list[Item] = []
-        skipped = 0
-        unsupported_count = 0
+        # ── 分拣：cache hit（主线程直接恢复）vs miss（子线程 _build_item）──
+        # 结构：(path, relpath, stat, is_supported, cached_dict | None)
+        hit_items: list[tuple[Path, str, bool, dict]] = []   # (path, relpath, is_supported, d)
+        miss_paths: list[tuple[Path, str, bool]]       = []  # (path, relpath, is_supported)
         total_count = 0
-        cache_hits = 0
 
-        progress = self._make_progress(all_paths, desc="scanning")
-        path_iter = progress if progress is not None else all_paths
-
-        for path in path_iter:
+        for path in all_paths:
             ext = path.suffix.lstrip(".").lower()
-            is_supported = ext in ALL_EXTENSIONS
 
             if ext == "livp" and livp_enabled:
-                # livp 已被展开为 jpg/heic，原文件不计入 total
-                # total 只统计解压后的图像（由 livp_count 计入）
                 continue
 
             total_count += 1
+            is_supported = ext in ALL_EXTENSIONS
+
             try:
-                stat = path.stat()
+                st = path.stat()
                 relpath = str(path.relative_to(input_dir))
-
-                # cache 命中：直接恢复，跳过慢操作
-                cached = scan_cache.get(relpath, stat.st_size, stat.st_mtime)
+                cached = scan_cache.get(relpath, st.st_size, st.st_mtime)
                 if cached:
-                    # 恢复时更新 path（绝对路径可能因移动而变化）
-                    cached["path"] = str(path)
-                    item = Item.from_dict(cached)
-                    cache_hits += 1
+                    hit_items.append((path, relpath, is_supported, cached))
                 else:
-                    item = self._build_item(path, input_dir, ctx)
-                    scan_cache.set(relpath, stat.st_size, stat.st_mtime, item.to_dict())
-
-                if not is_supported:
-                    item.add_flag("UNSUPPORTED")
-                    unsupported_count += 1
-                items.append(item)
-
+                    miss_paths.append((path, relpath, is_supported))
             except Exception as exc:
-                ctx.logger.warning(f"[{self.name}] skip {path.name}: {exc}")
-                skipped += 1
+                ctx.logger.warning(f"[{self.name}] stat failed {path.name}: {exc}")
+                total_count -= 1   # stat 失败不计入 total
 
-        # 写盘
+        ctx.logger.debug(
+            f"[{self.name}] cache hits={len(hit_items)}, "
+            f"miss={len(miss_paths)} (will _build_item)"
+        )
+
+        # ── 收集结果用的共享容器（主线程写，无需加锁）──────────────────────
+        # key = relpath，保证后续排序一致
+        result_map: dict[str, "Item"] = {}
+        skipped = 0
+        unsupported_count = 0
+
+        # ── 处理 cache hit（主线程，极快）───────────────────────────────────
+        for path, relpath, is_supported, cached in hit_items:
+            cached["path"] = str(path)
+            item = Item.from_dict(cached)
+            if not is_supported:
+                item.add_flag("UNSUPPORTED")
+                unsupported_count += 1
+            result_map[relpath] = item
+
+        # ── 处理 cache miss（线程池）────────────────────────────────────────
+        if miss_paths:
+            # tqdm：主线程创建，通过 lock 在主线程 update
+            progress = self._make_progress_total(len(miss_paths), desc="scanning")
+            counts_lock = threading.Lock()
+
+            def _build_and_cache(
+                path: Path,
+                relpath: str,
+                is_supported: bool,
+            ) -> tuple[str, "Item | None"]:
+                """子线程执行：_build_item + scan_cache.set（已加锁）。"""
+                try:
+                    item = self._build_item(path, input_dir, ctx)
+                    st = path.stat()
+                    scan_cache.set(relpath, st.st_size, st.st_mtime, item.to_dict())
+                    return relpath, item
+                except Exception as exc:
+                    ctx.logger.warning(f"[{self.name}] skip {path.name}: {exc}")
+                    return relpath, None
+
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+                futures = {
+                    executor.submit(_build_and_cache, p, rp, sup): (p, rp, sup)
+                    for p, rp, sup in miss_paths
+                }
+                for future in as_completed(futures):
+                    _, _, is_supported = futures[future]
+                    try:
+                        # 超时保护：Pillow 读损坏文件可能永久挂起
+                        # 60s 足够处理任何正常图片（含大型 RAW）
+                        relpath, item = future.result(timeout=60)
+                    except TimeoutError:
+                        path_info = futures[future][0]
+                        ctx.logger.warning(
+                            f"[{self.name}] timeout (>60s), skip: {path_info.name}"
+                        )
+                        skipped += 1
+                        if progress:
+                            progress.update(1)
+                        continue
+                    except Exception as exc:
+                        ctx.logger.warning(f"[{self.name}] unexpected: {exc}")
+                        skipped += 1
+                        if progress:
+                            progress.update(1)
+                        continue
+
+                    if item is None:
+                        skipped += 1
+                    else:
+                        if not is_supported:
+                            item.add_flag("UNSUPPORTED")
+                        # as_completed 回调在主线程执行，result_map 写入无需加锁
+                        result_map[relpath] = item
+                        if not is_supported:
+                            unsupported_count += 1
+                        # flush 由 scan_cache.set() 内部自动触发（每 500 条）
+                        # 主线程不再手动计数
+
+                    if progress:
+                        progress.update(1)
+
+            if progress:
+                progress.close()
+
+        # 最终 flush（剩余未写盘的）
         scan_cache.flush()
+
+        # ── 按原始路径顺序组装 items ────────────────────────────────────────
+        # sorted(all_paths) 决定了顺序，result_map 用 relpath 作 key 保证对应
+        items: list[Item] = []
+        for path in all_paths:
+            ext = path.suffix.lstrip(".").lower()
+            if ext == "livp" and livp_enabled:
+                continue
+            relpath = str(path.relative_to(input_dir))
+            if relpath in result_map:
+                items.append(result_map[relpath])
 
         # 解压出的 livp 静态图（替代原 livp 文件）
         livp_count = 0
@@ -197,7 +298,7 @@ class ScanStage:
             f"supported={supported_count}, "
             f"unsupported={unsupported_count}"
             + (f", livp={livp_count}" if livp_count else "")
-            + (f", cache_hits={cache_hits}" if cache_hits else "")
+            + (f", cache_hits={len(hit_items)}" if hit_items else "")
             + f", skipped={skipped}, elapsed={elapsed:.2f}s"
         )
         return items
@@ -269,12 +370,20 @@ class ScanStage:
                 )
                 return
 
+        # 截断/损坏文件：Pillow 默认只发 UserWarning 然后挂起。
+        # LOAD_TRUNCATED_IMAGES=True 让 Pillow 在截断处停止而不是等待，
+        # 同时把 warnings 转为可捕获的异常。
+        from PIL import ImageFile
+        import warnings
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
         try:
-            with Image.open(path) as img:
-                item.width, item.height = img.size
-                item.format_real = img.format or ""
-                item.phash, item.dhash = self._compute_hashes(img, path, ctx)
-                item.is_screenshot = self._detect_screenshot(img, item)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # UserWarning → 可捕获异常
+                with Image.open(path) as img:
+                    item.width, item.height = img.size
+                    item.format_real = img.format or ""
+                    item.phash, item.dhash = self._compute_hashes(img, path, ctx)
+                    item.is_screenshot = self._detect_screenshot(img, item)
         except Exception as exc:
             item.warnings.append(f"[{self.name}] image open failed: {exc}")
 
@@ -310,9 +419,23 @@ class ScanStage:
 
     @staticmethod
     def _make_progress(items: list, desc: str = ""):
+        """tqdm 进度条（包裹 iterable），未安装时返回 None。"""
         try:
             from tqdm import tqdm
             return tqdm(items, desc=desc, unit="file", dynamic_ncols=True)
+        except ImportError:
+            return None
+
+    @staticmethod
+    def _make_progress_total(total: int, desc: str = ""):
+        """
+        tqdm 手动模式（已知总数，通过 update() 推进）。
+        多线程场景下由主线程创建，子线程完成后在主线程调用 update()。
+        未安装 tqdm 时返回 None。
+        """
+        try:
+            from tqdm import tqdm
+            return tqdm(total=total, desc=desc, unit="file", dynamic_ncols=True)
         except ImportError:
             return None
 

@@ -47,14 +47,21 @@ BucketType = Literal[
     "unsupported",
 ]
 
-_EXT_FORMAT_MAP: dict[str, str] = {
-    "jpg": "JPEG", "jpeg": "JPEG",
-    "png": "PNG",
-    "heic": "HEIF", "heif": "HEIF",
-    "tiff": "TIFF", "tif": "TIFF",
-    "webp": "WEBP",
-    "gif": "GIF",
-    "bmp": "BMP",
+# ext → 该扩展名合法对应的 format_real 集合（Pillow 返回值，大写）
+# 用集合而非单值，支持一个扩展名对应多种合法格式：
+#   MPO：富士/索尼 3D 照片，两张 JPEG 打包，文件头是 JPEG，Pillow 识别为 MPO
+#        扩展名是 .jpg，不是格式错误，无需转换
+_EXT_FORMAT_MAP: dict[str, frozenset[str]] = {
+    "jpg":  frozenset({"JPEG", "MPO"}),   # MPO 是合法的 .jpg（3D 照片）
+    "jpeg": frozenset({"JPEG", "MPO"}),
+    "png":  frozenset({"PNG"}),
+    "heic": frozenset({"HEIF"}),
+    "heif": frozenset({"HEIF"}),
+    "tiff": frozenset({"TIFF"}),
+    "tif":  frozenset({"TIFF"}),
+    "webp": frozenset({"WEBP"}),
+    "gif":  frozenset({"GIF"}),
+    "bmp":  frozenset({"BMP"}),
 }
 
 _FORMAT_EXT_MAP: dict[str, str] = {
@@ -259,8 +266,9 @@ class ExportPlanner:
         real = (item.format_real or "").upper()
         if ext in _VIDEO_EXTENSIONS or ext in _RAW_EXTENSIONS or not real:
             return False, ext, ""
-        expected = _EXT_FORMAT_MAP.get(ext, "").upper()
-        if not expected or real == expected:
+        expected_set = _EXT_FORMAT_MAP.get(ext)
+        # 扩展名不在映射表中，或 format_real 在合法集合内 → 无需转换
+        if not expected_set or real in expected_set:
             return False, ext, ""
         target_ext = _FORMAT_EXT_MAP.get(real, ext)
         return True, target_ext, f".{ext} but actually {real}"
