@@ -28,8 +28,9 @@ if __name__ == "__main__":
     n = 1000
     # src = "/media/marx/My Passport/camera"
     src = "/media/marx/My Passport/Collection"
-    dst = os.path.join(src + "_" + str(n))
+    dst = "/home/marx/code/data"
+    out = os.path.join(dst, os.path.basename(src) + "_" + str(n))
 
 
 
-    sample_files(src, dst, n)
+    sample_files(src, out, n)

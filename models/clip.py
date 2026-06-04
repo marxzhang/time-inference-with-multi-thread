@@ -195,7 +195,9 @@ class ClipModel:
 
         try:
             from PIL import Image
-            img = Image.open(path).convert("RGB")
+            # img = Image.open(path).convert("RGB")
+            with Image.open(path) as img:  # ← 关键修改
+                img = img.convert("RGB")
             return self._preprocess(img)
         except Exception:
             return None

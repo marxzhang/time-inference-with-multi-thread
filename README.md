@@ -1,191 +1,336 @@
 # time_inference
 
-从照片的 EXIF、文件名、文件夹名、相似图等多种来源推断拍摄时间，并将照片整理导出到结构化目录。
+从照片的 EXIF、文件名、文件夹名、图像相似度等多种来源推断拍摄时间，并将整个相册整理导出为结构化文件夹。
 
-## 功能概述
+---
 
-- **时间推断**：按可信度从高到低依次尝试 EXIF、文件名正则、文件夹名、相似图（CLIP）、文件系统时间
-- **去重**：支持字节级（sha1）、感知哈希（phash）、语义相似（CLIP）三档去重强度
-- **导出**：将照片分为 `confident` / `review` / `duplicate` / `unsupported` 四组输出，保持原始目录结构
-- **Live Photo**：自动解压 `.livp` 文件，提取静态图参与流程
-- **断点续传**：Scan 缓存 + Pipeline Checkpoint，中断后重启自动跳过已完成部分
-- **多线程**：Pipeline 和 Writer 均支持并发，`--workers` 控制线程数
+## 核心能力
+
+- **多源时间推断**：按置信度从高到低依次尝试 EXIF、文件名正则、文件夹语义、相似图借时、文件系统时间，综合决策出最可靠的时间
+- **动态模式挖掘**：从大量文件名中自动归纳未知命名规范，支持中文前缀、多段数字（如 `Screenshot_2019_0723_152344`）等复杂格式
+- **去重**：支持字节级（sha1）、视觉级（phash）、语义级（CLIP）三档去重
+- **格式修复**：检测扩展名与真实格式不符的文件（如 `.jpg` 实际是 PNG），转换后输出；MPO（3D 照片）被正确识别，不触发误报
+- **Live Photo**：解压 `.livp`，提取静态图参与完整 pipeline
+- **结构化导出**：输出分 `confident / review / duplicate / unsupported` 四个 bucket，保持原始目录结构；HTML summary 支持点击文件名直接打开原图
+- **全程断点续传**：Scan 阶段有独立缓存，pipeline 有 checkpoint，writer 按 action 逐条更新状态，任意阶段中断后可继续
+- **多线程**：Scan、pipeline、writer 均支持 `--workers` 并发
 
 ---
 
 ## 安装
 
+**Python 3.10+**
+
+### 必装
+
 ```bash
-# 基础依赖
-pip install Pillow imagehash piexif tqdm
-
-# HEIC/HEIF 支持（iPhone 照片）
-pip install pillow-heif
-
-# CLIP 相似图推断（可选，需要 GPU）
-pip install open-clip-torch torch torchvision
-
-# faiss 向量索引（CLIP 模式需要）
-pip install faiss-cpu   # 或 faiss-gpu
+pip install Pillow piexif imagehash tqdm
 ```
 
-Python 版本要求：>= 3.10
+### HEIC / HEIF 支持（iPhone 照片）
+
+```bash
+pip install pillow-heif
+```
+
+### CLIP 语义相似推断（可选，需要 GPU 效果更好）
+
+```bash
+pip install open-clip-torch torch torchvision
+pip install faiss-cpu   # 或 faiss-gpu
+```
 
 ---
 
 ## 快速开始
 
+### 最简：分析 + 预览
+
 ```bash
-# 最简运行：推断时间，不导出
-python main.py /path/to/photos
+python main.py /photos --dry-run --dump-json result.json
+```
 
-# 推断 + 去重 + 生成导出计划
-python main.py /path/to/photos \
-  --dedup sha1 \
-  --export-plan \
-  --export-dir /path/to/export
+### 生成导出计划，人工审查后执行
 
-# 审查 export_plan_summary.html 后执行导出
-python main.py /path/to/photos \
-  --export-write \
-  --export-dir /path/to/export
+```bash
+# 第一步：分析，生成 plan 文件和 HTML summary
+python main.py /photos --export-dir /export --export-plan
 
-# 完整流程（推断 + 去重 + 缓存 + 断点续传 + 一步导出）
-python main.py /path/to/photos \
-  --cache --checkpoint --workers 8 \
+# 用浏览器打开 /export/*_summary.html，点击文件名审查每个决策
+
+# 第二步：执行
+python main.py --write-only --export-dir /export
+```
+
+### 推荐的完整命令（大量照片）
+
+```bash
+# 首次运行
+python main.py /photos \
+  --export-dir /export \
   --dedup phash \
-  --export-plan --export-write \
-  --export-dir /path/to/export
+  --cache --checkpoint \
+  --workers 4 \
+  --export-plan --export-write
+
+# 中途中断后续传
+python main.py /photos \
+  --export-dir /export \
+  --dedup phash \
+  --cache --checkpoint \
+  --workers 4 \
+  --export-write
 ```
 
 ---
 
-## 命令行参数
+## Pipeline 执行流程
 
-### 基础
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `input_dir` | （必填）| 扫描的根目录 |
-| `--output`, `-o` | `""` | 输出目录，默认原地写回 |
-| `--dry-run` | `false` | 只推断，不写回任何文件 |
-| `--workers`, `-w` | `4` | 并发线程数 |
-| `--log-level` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `--log-file` | `""` | 日志写入文件路径，默认只输出终端 |
-
-### 缓存与断点续传
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--cache` | `false` | 启用计算结果缓存（CLIP embedding 等跨运行复用） |
-| `--checkpoint` | `false` | 启用 Pipeline 断点续传 |
-| `--cache-dir` | `.cache` | cache / checkpoint 存放目录 |
-
-> Scan 阶段的断点续传**始终启用**，不需要额外参数。
-
-### 去重
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--dedup` | `sha1` | 去重强度：`no` / `sha1` / `phash` / `clip`，每档包含上一档 |
-| `--dedup-phash-threshold` | `4` | phash 汉明距离阈值（`phash` / `clip` 模式生效） |
-
-去重强度说明：
-
-- `no` — 不去重
-- `sha1` — 字节完全相同（安全，适合清理明确副本）
-- `phash` — 视觉相同，覆盖格式转换、JPEG 重压缩（阈值 ≤ 4 位）
-- `clip` — 语义相似，覆盖连拍、同场景多张（需要 `--clip`）
-
-### CLIP
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--clip` | `false` | 启用 CLIP embedding + 相似图时间推断 |
-| `--clip-model` | `ViT-B-32` | 模型名称（`ViT-B-32` / `ViT-L-14` / `ViT-H-14`） |
-| `--clip-min-score` | `0.85` | 相似图余弦相似度阈值 |
-
-### 文件处理
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--livp` | `false` | 解压 `.livp`（Apple Live Photo），提取静态图参与流程 |
-| `--skip-ext` | `""` | 追加跳过的扩展名（逗号分隔，不含点）；`=pdf,txt` 完全覆盖默认值 |
-| `--no-mine` | `false` | 禁用文件名模式自动挖掘（PatternMiner） |
-
-### 导出
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--export-dir` | `""` | 导出根目录 |
-| `--export-plan` | `false` | 生成导出计划（`*_plan.jsonl` + `*_summary.html`） |
-| `--export-write` | `false` | 执行导出计划中的文件操作，支持断点续传 |
-
-### 调试
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--confidence-threshold` | `0.6` | 低于此值标记 `LOW_CONFIDENCE` |
-| `--dump-json` | `""` | 将所有 item 结果导出为 JSON（调试用） |
-
----
-
-## 时间推断来源与置信度
-
-系统对每张照片收集多条 Evidence，由 ResolverStage 选出最优结果：
-
-| 来源 | 置信度 | 精度 | 说明 |
-|---|---|---|---|
-| EXIF `DateTimeOriginal` | 1.0 | 秒 | 最权威，相机快门时刻 |
-| EXIF `DateTimeDigitized` | 0.9 | 秒 | 数字化时刻，扫描件常用 |
-| 文件名（含完整时间戳）| 0.9 | 秒 | 如 `IMG_20200101_143022.jpg` |
-| 文件名（含日期）| 0.75 | 天 | 如 `WeiXin_20190821.jpg` |
-| EXIF `DateTime` | 0.6 | 秒 | 易被编辑软件改写 |
-| 文件夹名 | 0.3–0.7 | 年/月/天 | 人工整理的目录 |
-| 相似图推断（CLIP）| 0.45–0.75 | 继承 | 借用相邻相似图的时间 |
-| 文件系统 mtime | 0.2 | 秒 | 兜底，极不可靠 |
-
-置信度低于 `--confidence-threshold`（默认 0.6）的照片会被标记为 `LOW_CONFIDENCE`，在导出时放入 `review/` 目录。
+```
+[可选] LivePhotoStage     .livp → 解压到临时目录
+         ↓
+ScanStage                 扫描文件，计算 sha1 / phash / 图像元信息
+                          Scan Cache 自动启用：已扫描文件直接恢复，跳过 sha1/phash 重算
+         ↓
+PatternMiner              从文件名挖掘未知命名规范 → 动态 DatePattern
+         ↓
+ExifStage                 读取 EXIF，提取时间 / GPS / 设备信息
+FilenameStage             文件名 + 文件夹名模式匹配
+[可选] ClipStage          计算 CLIP embedding
+         ↓
+ResolverStage             从所有证据中决策最终时间（写入 time_result）
+         ↓
+[BatchStage] SimilarStage 相似图借时（需要 --clip）
+[BatchStage] DedupStage   全量去重分组
+         ↓
+ExportPlanner             生成 *_plan.jsonl + *_summary.html
+ExportWriter              执行文件操作（copy / convert / duplicate）
+```
 
 ---
 
 ## 导出目录结构
 
 ```
-export_dir/
-├── 20240519143022_photos_plan.jsonl      # 导出计划（机器读取）
-├── 20240519143022_photos_summary.html    # 导出摘要（人工审查，含超链接）
-├── confident/                            # 时间可信，可直接使用
-│   └── （原始目录结构）
-├── review/                               # 需要人工确认
-│   └── （原始目录结构）
+export/
+├── 20260519150830_photos_plan.jsonl      # 机器可读，Writer 断点续传用
+├── 20260519150830_photos_summary.html    # 人工审查，含可点击文件超链接
+│
+├── confident/          时间可信，可直接使用
+│   └── (原始目录结构)
+│
+├── review/             时间置信度低 / 有冲突 / 需要人工确认
+│   └── (原始目录结构)
 │       ├── photo.jpg
-│       └── photo.jpg.review.txt         # 说明原因
-├── duplicate/                            # 去重后的冗余文件
-│   └── （原始目录结构）
+│       └── photo.jpg.review.txt      ← 说明进入 review 的具体原因
+│
+├── duplicate/          被识别为重复的文件（保留最优，其余移至此）
+│   └── (原始目录结构)
 │       ├── photo.jpg
-│       └── photo.jpg.duplicate.txt      # 说明与哪张图重复
-└── unsupported/                          # 不支持的格式
-    └── （原始目录结构）
+│       └── photo.jpg.duplicate.txt  ← 说明与哪张图重复、重复类型
+│
+└── unsupported/        不支持的格式（原样复制，不处理）
+    └── (原始目录结构)
 ```
 
-`total = confident + review + duplicate + unsupported`
+> **等式保证**：`total files = confident + review + duplicate + unsupported`
 
 ---
 
-## 支持的格式
+## 时间证据来源与置信度
 
-**图片**（完整分析）：
-`jpg` `jpeg` `png` `gif` `bmp` `tiff` `tif` `webp` `heic` `heif` `avif` `raw` `cr2` `cr3` `nef` `arw` `orf` `rw2` `dng`
+| 来源 | 置信度 | 备注 |
+|---|---|---|
+| EXIF DateTimeOriginal | 1.00 | 最权威，快门按下的瞬间 |
+| EXIF DateTimeDigitized | 0.90 | 数字化时间（扫描件常用）|
+| 文件名（精确到秒）| 0.90 | 如 `IMG_20200101_143022.jpg` |
+| 文件名（精确到天）| 0.75 | 如 `WeiXin_20190821.jpg` |
+| EXIF DateTime | 0.60 | 容易被编辑软件改写 |
+| 相似图借时 | 0.45–0.75 | 依赖 CLIP 余弦相似度 |
+| 文件夹名 | 0.20–0.60 | 人工整理，精度通常较低 |
+| 文件系统 mtime | 0.20 | 最后兜底，极不可靠 |
 
-**视频**（生成 item，跳过图片字段分析）：
+置信度低于 `--confidence-threshold`（默认 0.6）的文件进入 `review/` bucket。
+
+---
+
+## 去重档位
+
+| 档位 | 判断依据 | 适用场景 |
+|---|---|---|
+| `no` | 不去重 | 只需时间推断 |
+| `sha1`（默认）| 字节完全一致 | 安全，覆盖完全相同的副本 |
+| `phash` | 感知哈希汉明距离 ≤ 4 | 不同格式/压缩率的同一张图 |
+| `clip` | 包含 phash，且标记肉眼相似 | 连拍识别，需要 `--clip` |
+
+每档包含上一档效果：`clip ⊃ phash ⊃ sha1`
+
+重复组内保留"最优"文件的评分标准（分越高越好）：
+
+- +3.0 有 EXIF DateTimeOriginal
+- +2.0 时间置信度 ≥ 0.9
+- +1.0 时间置信度 ≥ 0.7
+- +1.0 文件格式与扩展名匹配（无需转换）
+- +0.5 有 GPS 信息
+- −1.0 是截图
+- 文件大小作为最终 tiebreaker
+
+---
+
+## 完整命令行参数
+
+### 基础
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `input_dir` | — | 扫描根目录（`--write-only` 时可省略）|
+| `--dry-run` | — | 只推断，不写任何文件 |
+| `--workers` | 4 | 并发线程数（1 = 串行）|
+| `--confidence-threshold` | 0.6 | 低于此值进入 review |
+
+### 导出
+
+| 参数 | 说明 |
+|---|---|
+| `--export-dir` | 导出根目录（四个 bucket 的父目录）|
+| `--export-plan` | 生成 plan 文件和 HTML summary |
+| `--export-write` | 执行导出（需先有 plan 文件）|
+| `--write-only` | 只运行 Writer，跳过所有分析（`input_dir` 可省略）|
+
+### 缓存与断点续传
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--cache` | — | 启用 CLIP embedding 等跨运行缓存 |
+| `--checkpoint` | — | 启用 pipeline 断点续传 |
+| `--cache-dir` | `.cache` | 缓存文件存放目录 |
+
+> **Scan Cache 始终自动启用**（存于 `cache-dir/scan_cache.jsonl`），无需额外参数。已扫描过的文件（路径 + 大小 + mtime 不变）直接恢复，跳过 sha1 和 phash 计算。
+
+### 去重
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--dedup` | `sha1` | 去重档位：`no` / `sha1` / `phash` / `clip` |
+| `--dedup-phash-threshold` | 4 | phash 汉明距离阈值 |
+
+### CLIP（可选）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--clip` | — | 启用 CLIP embedding + 相似图时间推断 |
+| `--clip-model` | `ViT-B-32` | 模型（越大越准越慢，可选 `ViT-L-14`）|
+| `--clip-min-score` | 0.85 | 余弦相似度阈值 |
+
+### 文件过滤
+
+| 参数 | 说明 |
+|---|---|
+| `--livp` | 解压 Apple Live Photo `.livp` |
+| `--skip-ext` | 追加跳过的扩展名（`pdf,txt`）；`=pdf` 完全覆盖默认值 |
+
+默认跳过（不建立 item，不统计）：`ds_store` `db` `ini` `nomedia` `json` `xml` `txt` `md` `pdf` `xmp` `thm`
+
+### 调试
+
+| 参数 | 说明 |
+|---|---|
+| `--log-level` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `--log-file` | 同时写入日志文件 |
+| `--dump-json` | 将所有 item 完整序列化为 JSON |
+| `--no-mine` | 禁用 PatternMiner（文件名模式自动挖掘）|
+
+---
+
+## 支持的文件格式
+
+### 图片（参与完整 pipeline）
+
+`jpg` `jpeg` `png` `gif` `bmp` `tiff` `tif` `webp`  
+`heic` `heif` `avif`  
+`raw` `cr2` `cr3` `nef` `arw` `orf` `rw2` `dng`
+
+> **MPO**（富士/索尼 3D 照片）：扩展名 `.jpg`，Pillow 识别为 `MPO` 格式，属于合法格式，不触发格式转换。
+
+### 视频（建立 item，跳过图像分析）
+
 `mp4` `mov` `avi` `mkv` `m4v` `3gp` `wmv` `flv` `ts`
 
-**特殊处理**：
-- `.livp` — Apple Live Photo，需加 `--livp` 参数解压后处理
+### Live Photo（需 `--livp`）
 
-**默认跳过**（不计入统计）：
-`ds_store` `db` `ini` `nomedia` `json` `xml` `txt` `md` `pdf` `xmp` `thm`
+`.livp` → 解压，优先提取 `.heic`，其次 `.jpg`，作为普通图片参与 pipeline
+
+---
+
+## 典型使用场景
+
+### 场景 1：只看时间推断结果，不导出
+
+```bash
+python main.py /photos --dry-run --dump-json result.json --log-level INFO
+```
+
+### 场景 2：整理并导出，去掉重复文件
+
+```bash
+python main.py /photos \
+  --dedup phash \
+  --export-dir /export \
+  --export-plan --export-write
+```
+
+### 场景 3：iPhone 照片（HEIC + Live Photo）
+
+```bash
+pip install pillow-heif
+
+python main.py /iphone_backup \
+  --livp \
+  --dedup sha1 \
+  --export-dir /export \
+  --export-plan --export-write
+```
+
+### 场景 4：大量照片，全功能
+
+```bash
+# 首次（建立各类缓存）
+python main.py /photos \
+  --dedup phash \
+  --clip --cache \
+  --checkpoint \
+  --workers 8 \
+  --export-dir /export \
+  --export-plan --export-write
+
+# 增量运行或续传（scan cache 和 embedding cache 自动命中）
+python main.py /photos \
+  --dedup phash \
+  --clip --cache \
+  --checkpoint \
+  --workers 8 \
+  --export-dir /export \
+  --export-plan --export-write
+```
+
+### 场景 5：只重新执行导出（已有 plan）
+
+```bash
+# plan 文件已存在，只执行文件操作
+python main.py --write-only --export-dir /export
+
+# 或等价写法（省略 input_dir 时自动进入 write-only 模式）
+python main.py --export-write --export-dir /export
+```
+
+---
+
+## 安全说明
+
+- **原始文件只读**：所有分析操作不修改输入目录中的任何文件
+- **导出目录保护**：Writer 启动时检查 `export-dir` 不是 `input-dir` 的子目录，防止误操作覆盖源文件
+- **幂等导出**：Writer 复制/转换前检查目标文件是否已存在且内容一致（sha1 比对），一致则跳过，不会重复写入
+- **格式转换保留元数据**：转换时优先从原始文件传递 EXIF bytes 和 ICC 色彩配置文件给 Pillow，尽量避免元数据丢失；RAW 格式不做转换，直接复制
 
 ---
 
@@ -193,104 +338,55 @@ export_dir/
 
 ```
 time_inference/
-├── main.py                  # 程序入口，CLI 参数解析
-├── config.py                # 全局配置 dataclass
+├── config.py                  全局配置（所有可调参数）
+├── main.py                    程序入口，CLI 参数解析
+│
 ├── core/
-│   ├── context.py           # 全局运行上下文（config、logger、cache、models）
-│   ├── evidence.py          # 时间证据数据类
-│   ├── item.py              # 照片 Item 数据类（pipeline 的数据载体）
-│   ├── pipeline.py          # Stage 执行顺序定义
-│   ├── scheduler.py         # 运行调度（支持多线程）
-│   └── stage_base.py        # Stage 抽象基类
+│   ├── context.py             全局运行上下文（config / logger / cache / models）
+│   ├── evidence.py            时间证据数据类
+│   ├── item.py                照片 Item（贯穿整个 pipeline 的数据载体）
+│   ├── pipeline.py            Stage 执行顺序定义
+│   ├── scheduler.py           运行调度（多线程、checkpoint 协调）
+│   └── stage_base.py          Stage / BatchStage 抽象基类
+│
 ├── stages/
-│   ├── scan.py              # 扫描目录，生成 Item 列表
-│   ├── exif.py              # 提取 EXIF 时间、GPS、设备信息
-│   ├── filename.py          # 从文件名 / 文件夹名推断时间
-│   ├── clip.py              # 计算 CLIP embedding
-│   ├── similar.py           # 相似图时间推断（BatchStage）
-│   ├── dedup.py             # 去重分组（BatchStage）
-│   ├── resolver.py          # 从多条 Evidence 决策最终时间
-│   └── livephoto.py         # .livp 文件解压预处理
+│   ├── scan.py                扫描目录，生成 Item 列表（含 Scan Cache）
+│   ├── exif.py                EXIF 提取与时间推断
+│   ├── filename.py            文件名 / 文件夹名时间推断
+│   ├── clip.py                CLIP embedding 计算
+│   ├── similar.py             相似图时间推断（BatchStage）
+│   ├── resolver.py            多证据决策，写入 time_result
+│   ├── dedup.py               全量去重分组（BatchStage）
+│   └── livephoto.py           .livp 解压预处理
+│
 ├── models/
-│   ├── __init__.py          # ModelContainer（统一持有各 ML 模型）
-│   └── clip.py              # CLIP 模型封装（懒加载，自动选择设备）
+│   ├── __init__.py            ModelContainer（统一模型持有者）
+│   └── clip.py                CLIP 模型封装（懒加载，自动选设备）
+│
 ├── storage/
-│   ├── cache.py             # 计算结果缓存（CLIP embedding 等，线程安全）
-│   ├── scan_cache.py        # Scan 断点续传缓存（relpath+stat 寻址）
-│   ├── checkpoint.py        # Pipeline 断点续传（item 级，线程安全）
-│   └── index.py             # faiss 向量索引 + phash 索引
-├── export/
-│   ├── planner.py           # 导出规划器（生成 ExportAction 列表和 HTML summary）
-│   └── writer.py            # 导出执行器（支持断点续传和多线程）
-└── utils/
-    ├── patterns.py          # 预置时间正则模式库
-    ├── miner.py             # 文件名模式自动挖掘（字符类型模板统计）
-    └── time.py              # 时间解析工具（预留）
+│   ├── cache.py               计算结果缓存（CLIP 等，跨运行持久化，按 sha1 索引）
+│   ├── scan_cache.py          Scan 断点续传缓存（按 relpath+stat 索引）
+│   ├── checkpoint.py          Pipeline 运行状态缓存（断点续传）
+│   └── index.py               faiss 向量索引 + phash 哈希索引
+│
+├── utils/
+│   ├── patterns.py            预置时间正则模式库（11 种格式）
+│   └── miner.py               文件名模式挖掘器（结构驱动 + 多假设解析）
+│
+└── export/
+    ├── planner.py             ExportAction 决策 + HTML summary 生成
+    └── writer.py              文件操作执行（copy / convert / duplicate）
 ```
 
 ---
 
-## 典型使用场景
+## 缓存文件说明
 
-### 场景一：整理手机备份
+程序运行后会在 `--cache-dir`（默认 `.cache`）下生成以下文件：
 
-```bash
-python main.py ~/Pictures/iPhone_Backup \
-  --livp \
-  --dedup phash \
-  --cache --checkpoint \
-  --export-plan --export-write \
-  --export-dir ~/Pictures/Organized
-```
-
-### 场景二：处理大量无 EXIF 的旧照片
-
-```bash
-# 第一步：分析推断（开启 CLIP 提高无 EXIF 照片的覆盖率）
-python main.py /media/OldPhotos \
-  --clip --cache \
-  --dedup phash \
-  --workers 8 \
-  --export-plan \
-  --export-dir /media/Export
-
-# 审查 HTML summary，确认去重结果和 review 原因
-
-# 第二步：执行导出
-python main.py /media/OldPhotos \
-  --export-write \
-  --export-dir /media/Export
-```
-
-### 场景三：调试 / 查看推断结果
-
-```bash
-python main.py /path/to/photos \
-  --dry-run \
-  --log-level DEBUG \
-  --dump-json /tmp/result.json
-```
-
----
-
-## 缓存机制说明
-
-系统有三层缓存，各自解决不同问题：
-
-| 缓存 | 存储位置 | Key | 解决的问题 |
-|---|---|---|---|
-| `scan_cache.jsonl` | `.cache/` | `relpath\|size\|mtime` | 避免重复计算 sha1 / phash |
-| `clip.jsonl` 等 | `.cache/` | `sha1` | 避免重复计算 CLIP embedding |
-| `checkpoint.jsonl` | `.cache/` | `item_id` | Pipeline 中断后续传 |
-
-Scan 缓存**始终启用**，其余需要 `--cache` / `--checkpoint` 参数开启。
-
----
-
-## 注意事项
-
-- `--export-dir` 不能是 `input_dir` 的子目录，系统会在启动时检查
-- `--export-write` 是幂等的：已完成的文件不会重复处理
-- 格式转换（ext 与真实格式不符）会保留原始 EXIF；无 EXIF 时写入推断时间
-- HEIC 格式需要安装 `pillow-heif`，否则该格式的 phash / 宽高等字段会为空
-- RAW 格式（cr2 / nef 等）不做格式转换，直接复制
+| 文件 | 内容 | 何时清除 |
+|---|---|---|
+| `scan_cache.jsonl` | 已扫描文件的 sha1 / phash / 图像信息 | 手动清除（跨运行持续有效）|
+| `clip.jsonl` | CLIP embedding 向量（按 sha1 索引）| 手动清除（更换模型时需清除）|
+| `checkpoint.jsonl` | Pipeline 运行状态（哪些 item 已完成）| 任务成功完成后自动删除 |
+| `livp_unpacked/` | .livp 解压出的临时图片 | Writer 完成后可手动删除 |

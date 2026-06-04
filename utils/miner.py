@@ -413,13 +413,21 @@ def _validate_pattern(
 ) -> float:
     """
     在 samples 上测试正则的命中率。
-    只统计能真正解析出合法 datetime 且年份一致的命中。
+
+    命中的定义：
+    1. 正则能 match 到子串
+    2. 能解析出合法的 datetime
+    3. 月/日数值在合法范围内（不检查年份：不同样本年份不同是正常的）
+
+    不检查年份的原因：
+        同一命名规范的文件可能跨年，验证的是"格式规律"而非"具体年份"。
+        但月/日必须合法（排除把随机数字误认为日期的情况）。
+
     返回 [0.0, 1.0] 的命中率。
     """
     if not samples:
         return 0.0
     hits = 0
-    expected_year = parsed.fields.get("year")
     for s in samples:
         m = pat.search(s)
         if not m:
@@ -427,10 +435,14 @@ def _validate_pattern(
         dt = _build_datetime(m.groupdict())
         if dt is None:
             continue
-        # 年份检查：若样本的年份各不相同（如文件夹按年组织），不做年份绑定
-        if expected_year is not None and dt.year != expected_year:
-            # 年份不匹配不算失败：可能不同样本年份不同
-            pass
+        # 额外验证：月/日若存在，必须在合法范围内
+        groups = m.groupdict()
+        month = int(groups["month"]) if "month" in groups and groups["month"] else None
+        day   = int(groups["day"])   if "day"   in groups and groups["day"]   else None
+        if month is not None and not (1 <= month <= 12):
+            continue
+        if day is not None and not (1 <= day <= 31):
+            continue
         hits += 1
     return hits / len(samples)
 
@@ -453,6 +465,13 @@ class PatternMiner:
         max_patterns: int = 20,
         match_rate_threshold: float = _MATCH_RATE_THRESHOLD,
     ) -> None:
+        """
+        参数
+        ----
+        min_count : 签名聚合计数的全局下限（兜底）。
+                    对高精度签名（>=12位），动态门槛会自动降到 2，
+                    此参数不会覆盖动态门槛——取二者中较小值。
+        """
         self.min_count             = min_count
         self.max_patterns          = max_patterns
         self.match_rate_threshold  = match_rate_threshold
@@ -536,16 +555,18 @@ class PatternMiner:
 
             dl, seps = sig
 
-            # 动态门槛：精度高的签名降低最低出现次数要求
-            # 同时用聚合 count（同总位数的所有签名之和）辅助判断
+            # 门槛：取 动态门槛 和 外部 min_count 二者中的较小值
+            # 动态门槛对高精度签名更宽松（14位签名只需 2 次）
+            # 外部 min_count 是用户设置的全局下限
             dynamic_min = _min_count_for_sig(dl)
+            effective_min = min(dynamic_min, self.min_count)
             group_total = group_counts[_grouping_key(dl)]
-            # 如果该签名本身不够，但同位数组合总量充足，降低门槛
-            if count < dynamic_min:
-                if group_total < self.min_count:
-                    continue   # 组合也不够，真的太少了，跳过
-                # 组合够了但单签名不够：降级到 2 次（避免误杀有价值的变体）
-                if count < 2:
+
+            if count < effective_min:
+                # 单签名不够，但同位数的所有签名加总足够 → 降至绝对下限 2
+                if group_total >= self.min_count and count >= 2:
+                    pass   # 允许继续
+                else:
                     continue
 
             dl, seps = sig

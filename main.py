@@ -19,21 +19,28 @@ main.py — 程序入口
     7. 输出结果摘要 / JSON
 """
 
+
 from __future__ import annotations
+
+# # === Debug hook ===
+# import tempfile
+# import traceback
+#
+# _orig = tempfile.TemporaryDirectory
+#
+# class DebugTempDir(_orig):
+#     def __init__(self, *args, **kwargs):
+#         print("\n[DEBUG] TemporaryDirectory created at:")
+#         traceback.print_stack(limit=8)
+#         super().__init__(*args, **kwargs)
+#
+# tempfile.TemporaryDirectory = DebugTempDir
 
 import argparse
 import json
 import sys
 import time
-import warnings
 from pathlib import Path
-
-# pillow_heif 在处理 HEIC 文件时内部创建 TemporaryDirectory 但未显式 cleanup，
-# 进程退出时 GC 会发出 ResourceWarning。文件已处理完毕，临时目录由 OS 回收，无害。
-warnings.filterwarnings(
-    "ignore", category=ResourceWarning, message=".*TemporaryDirectory.*"
-)
-
 
 # ---------------------------------------------------------------------------
 # CLI 参数解析
