@@ -97,6 +97,26 @@ def parse_args() -> argparse.Namespace:
         help="将所有 item 结果导出为 JSON 文件（调试用）",
     )
     parser.add_argument(
+        "--save-snapshot",
+        default="",
+        metavar="FILE",
+        help=(
+            "pipeline 完成后将所有 item 状态保存为 snapshot 文件（.jsonl）。"
+            "供第二阶段（TimelineStage）开发时独立加载，无需重跑第一阶段。"
+            "示例：--save-snapshot .cache/phase1.jsonl"
+        ),
+    )
+    parser.add_argument(
+        "--load-snapshot",
+        default="",
+        metavar="FILE",
+        help=(
+            "跳过第一阶段（Scan/Exif/Filename/Resolver/Dedup），"
+            "直接从 snapshot 文件恢复 items，只运行 TimelineStage 及之后的步骤。"
+            "示例：--load-snapshot .cache/phase1.jsonl"
+        ),
+    )
+    parser.add_argument(
         "--confidence-threshold",
         type=float,
         default=0.6,
@@ -288,6 +308,12 @@ def main() -> int:
     # ── 9. 输出 JSON（可选）──────────────────────────────────────────
     if args.dump_json:
         _dump_json(items, args.dump_json, ctx)
+        
+    # ── 9b. 保存 Snapshot（可选）───────────────────────────────────
+    if args.save_snapshot:
+        from storage.snapshot import save as _save_snapshot
+        n = _save_snapshot(items, Path(args.save_snapshot))
+        ctx.logger.info(f"[Snapshot] {n} items → {args.save_snapshot}")
 
     # ── 10. Export Plan（可选）────────────────────────────────────────
     if args.export_plan:
