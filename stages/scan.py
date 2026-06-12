@@ -252,6 +252,8 @@ class ScanStage:
 
         # 最终 flush（剩余未写盘的）
         scan_cache.flush()
+        # scan 完成后释放 scan_cache 内存，后续不再需要
+        scan_cache._store.clear()
 
         # ── 按原始路径顺序组装 items ────────────────────────────────────────
         # sorted(all_paths) 决定了顺序，result_map 用 relpath 作 key 保证对应

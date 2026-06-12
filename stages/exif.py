@@ -24,10 +24,19 @@ ExifStage — EXIF 提取与时间推断
     item.flags  ← NO_EXIF（完全无 EXIF 时）
 
 依赖：
-    piexif   pip install piexif    （主力，精确控制每个 IFD tag）
-    Pillow   pip install Pillow    （fallback，兼容更多格式）
+    Pillow   pip install Pillow    （主力，对损坏 EXIF 有保护，不会 OOM）
+    piexif   pip install piexif    （不再使用，保留 import 注释供参考）
 
-两者都没有时：只生成 filesystem evidence，不抛异常。
+换用 Pillow 作主力的原因：
+    piexif 对所有 IFD 的 count 字段不做合法性校验，损坏文件中
+    count=1,379,481,600 会让 struct.unpack 尝试分配 5GB 内存，
+    触发 OOM kill。此时进程已无内存执行 except 块，MemoryError
+    无法被 try/except 捕获，只能在调用前彻底绕开 piexif。
+    Pillow 对损坏 EXIF 会抛出普通 Exception，可正常捕获。
+
+    GPS IFD 在 Pillow._getexif() 中以 tag 34853 (0x8825) 返回，
+    本模块在 _read_with_pillow() 里将其提取为 "_gps" 键，
+    与原 piexif 路径的接口保持一致，下游解析代码无需改动。
 
 EXIF 时间格式说明：
     标准格式："%Y:%m:%d %H:%M:%S"
@@ -70,6 +79,9 @@ _TAG_GPS_ALT      = 6
 _TAG_GPS_TIME_UTC = 7
 _TAG_GPS_DATE     = 29
 
+# Pillow._getexif() 中 GPS IFD 的 tag id
+_PILLOW_GPS_IFD_TAG = 34853  # 0x8825
+
 # 支持解析的文件扩展名（视频没有 EXIF，跳过）
 _SUPPORTED_EXT = frozenset({
     "jpg", "jpeg", "tiff", "tif", "heic", "heif", "avif",
@@ -96,7 +108,8 @@ class ExifStage(Stage):
     """
     读取 EXIF，填充 item.exif，产出时间 Evidence。
 
-    优先使用 piexif（精确），fallback 到 Pillow._getexif()（兼容）。
+    以 Pillow 作为主力读取器，对损坏的 EXIF 结构（如 count 字段异常大）
+    能优雅失败而不会触发 OOM。
     """
 
     name = "ExifStage"
@@ -117,12 +130,11 @@ class ExifStage(Stage):
     def process(self, item: "Item", ctx: "Context") -> None:
         path = Path(item.path)
 
-        # 尝试用 piexif 读取
-        raw_exif = self._read_with_piexif(path, item, ctx)
-
-        # piexif 失败时 fallback 到 Pillow
-        if raw_exif is None:
-            raw_exif = self._read_with_pillow(path, item, ctx)
+        # 改动点：以 Pillow 作为主力读取器
+        # 原因：piexif 对损坏 EXIF 的 count 字段不做校验，
+        # 会触发无法捕获的 OOM kill（MemoryError 发生时内存已耗尽）。
+        # Pillow 内部有保护，损坏时抛出普通 Exception 可正常捕获。
+        raw_exif = self._read_with_pillow(path, item, ctx)
 
         # 两种方式都失败 → 无 EXIF
         if raw_exif is None:
@@ -131,11 +143,11 @@ class ExifStage(Stage):
             self._add_filesystem_evidence(item)
             return
 
-        # 解析结构化字段
+        # 解析结构化字段（接口与原 piexif 路径完全一致，无需改动）
         self._parse_datetime_fields(raw_exif, item)
         self._parse_gps_fields(raw_exif, item)
         self._parse_device_fields(raw_exif, item)
-        item.exif.raw = raw_exif
+        item.exif.raw = {}  # 不存原始数据，避免内存累积
 
         # 产出 Evidence
         self._emit_evidence(item)
@@ -149,47 +161,7 @@ class ExifStage(Stage):
             self._add_filesystem_evidence(item)
 
     # ------------------------------------------------------------------
-    # 读取：piexif（主力）
-    # ------------------------------------------------------------------
-
-    def _read_with_piexif(
-        self,
-        path: Path,
-        item: "Item",
-        ctx: "Context",
-    ) -> Optional[dict]:
-        """
-        用 piexif 读取，返回扁平化的 tag dict；失败返回 None。
-        扁平化结构：{tag_id: value, ...}，合并 IFD0 + ExifIFD + GPS IFD。
-        """
-        try:
-            import piexif
-        except ImportError:
-            ctx.logger.debug(f"[{self.name}] piexif not installed")
-            return None
-
-        try:
-            exif_dict = piexif.load(str(path))
-        except Exception as e:
-            ctx.logger.debug(f"[{self.name}] piexif failed for {path.name}: {e}")
-            return None
-
-        # 把各 IFD 合并到一个扁平 dict，GPS 单独保留
-        flat: dict = {}
-        for ifd_name in ("0th", "Exif"):
-            ifd = exif_dict.get(ifd_name, {})
-            if isinstance(ifd, dict):
-                flat.update(ifd)
-
-        # GPS 保持独立 key
-        gps = exif_dict.get("GPS", {})
-        if isinstance(gps, dict) and gps:
-            flat["_gps"] = gps
-
-        return flat if flat else None
-
-    # ------------------------------------------------------------------
-    # 读取：Pillow fallback
+    # 读取：Pillow（主力）
     # ------------------------------------------------------------------
 
     def _read_with_pillow(
@@ -200,24 +172,63 @@ class ExifStage(Stage):
     ) -> Optional[dict]:
         """
         用 Pillow._getexif() 读取，返回 {tag_id: value} dict；失败返回 None。
-        Pillow 的 _getexif 返回已解码的值（字节串已解码为字符串）。
+
+        改动点：
+        - 提升为主力读取器（原为 fallback）
+        - 将 GPS IFD（Pillow 以 tag 34853 返回）提取为 "_gps" 键，
+          与原 piexif 路径的接口保持一致，下游 _parse_gps_fields 无需改动。
         """
         try:
             from PIL import Image
-            from PIL.ExifTags import TAGS
         except ImportError:
             ctx.logger.debug(f"[{self.name}] Pillow not installed")
             return None
+
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        except ImportError:
+            pass
 
         try:
             with Image.open(path) as img:
                 exif_data = img._getexif()  # type: ignore[attr-defined]
                 if not exif_data:
                     return None
+
+                # 将 GPS IFD 从 tag 34853 提取为 "_gps" 键
+                # 使接口与原 piexif 路径一致，下游代码无需改动
+                if _PILLOW_GPS_IFD_TAG in exif_data:
+                    exif_data["_gps"] = exif_data.pop(_PILLOW_GPS_IFD_TAG)
+
                 return exif_data
         except Exception as e:
-            ctx.logger.debug(f"[{self.name}] Pillow fallback failed for {path.name}: {e}")
+            ctx.logger.debug(
+                f"[{self.name}] Pillow failed for {path.name}: {e}"
+            )
             return None
+
+    # ------------------------------------------------------------------
+    # 读取：piexif（已移除，保留方法签名供参考）
+    # ------------------------------------------------------------------
+
+    def _read_with_piexif(
+        self,
+        path: Path,
+        item: "Item",
+        ctx: "Context",
+    ) -> Optional[dict]:
+        """
+        已不再调用。
+
+        piexif 对所有 IFD 的 count 字段不做合法性校验：
+        损坏文件中 count=1,379,481,600 会让 struct.unpack 尝试分配 5GB，
+        触发 OOM kill。MemoryError 发生时进程已无内存执行 except 块，
+        try/except 无法捕获，必须在调用前彻底绕开。
+
+        保留此方法仅作记录，不再被 process() 调用。
+        """
+        return None
 
     # ------------------------------------------------------------------
     # 解析：时间字段
@@ -423,7 +434,7 @@ class ExifStage(Stage):
     def _rational_to_float(value: object) -> Optional[float]:
         """
         piexif 返回的 rational 是 (分子, 分母) 元组。
-        Pillow 有时直接返回 float。
+        Pillow 有时直接返回 float 或 IFDRational 对象。
         """
         if value is None:
             return None
@@ -434,7 +445,11 @@ class ExifStage(Stage):
             if den == 0:
                 return None
             return num / den
-        return None
+        # Pillow 的 IFDRational 对象支持直接转 float
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     # ------------------------------------------------------------------
     # 工具：GPS UTC 时间解析

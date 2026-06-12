@@ -183,8 +183,19 @@ class Scheduler:
         对单个 item 串行执行所有 Stage，并在完成后通知 checkpoint。
         此方法在子线程中调用，item 是该线程独占的，无需加锁。
         """
+        # # 写入当前正在处理的文件，覆盖模式（始终只保留最新一条）
+        # try:
+        #     with open("/tmp/current_item.txt", "w") as f:
+        #         f.write(f"{item.path}\n{item.relpath}\n")
+        # except Exception:
+        #     pass
+        
         for stage in self.pipeline.stages:
             stage.run(item, ctx)
+
+        # pipeline 处理完后清空运行日志，释放内存
+        # 只保留 warnings（有实际意义）
+        item.logs = []
 
         # checkpoint 的 on_item_done 内部已加锁，并发调用安全
         if ctx.checkpoint is not None:
@@ -196,7 +207,6 @@ class Scheduler:
 
     def _run_batch_stages(self, items: list["Item"], ctx: "Context") -> None:
         for batch_stage in self.pipeline.batch_stages:
-            ctx.logger.info(f"[Scheduler] batch stage: {batch_stage.name}")
             t0 = time.monotonic()
             try:
                 batch_stage.run_batch(items, ctx)
