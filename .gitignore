@@ -1,4 +1,7 @@
 .idea/
 weights/
 .cache/
-output
+output/
+tools/train_data_ner/weights/
+tools/train_data_ner/data/
+running-parameters.txt
