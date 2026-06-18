@@ -52,8 +52,7 @@ from model import DateNERModel, ModelConfig, VocabHelper
 
 def parse_args():
     p = argparse.ArgumentParser(description="训练 DateNER MTL 模型")
-    # p.add_argument("--data-dir",   default="tools/train_date_ner/data")
-    p.add_argument("--data-dir", default="/home/marx/code/AlbumTimeFixSystem/tools/train_data_ner/data")
+    p.add_argument("--data-dir",   default="data")
     p.add_argument("--out-dir",    default="weights")
     p.add_argument("--epochs",     type=int,   default=30)
     p.add_argument("--batch-size", type=int,   default=256)
@@ -185,6 +184,9 @@ def build_vocab_from_data(
     """
     从训练集重新统计字符频次，应用 cjk_min_freq 过滤，生成压缩词表。
     标签体系直接复用 orig_vocab（不变）。
+
+    返回 VocabHelper。序列化交给 VocabHelper.to_dict()（唯一来源），
+    调用方写盘时直接调用 vocab.to_dict()，不在此处重复构造字典。
     """
     import unicodedata
 
@@ -215,8 +217,7 @@ def build_vocab_from_data(
     print(f"  词表压缩: 保留 {kept} 个字符，丢弃 {dropped} 个低频CJK → "
           f"词表大小 {len(char2id)}（含 <PAD> <UNK>）")
 
-    # 构造新 VocabHelper（复用 label 体系）
-    vocab_data = {
+    return VocabHelper.from_dict({
         "char2id":  char2id,
         "id2char":  {str(v): k for k, v in char2id.items()},
         "label2id": orig_vocab.label2id,
@@ -225,14 +226,7 @@ def build_vocab_from_data(
         "pad_id":  0,
         "unk_id":  1,
         "num_labels": orig_vocab.num_labels,
-    }
-    import tempfile, os
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-    json.dump(vocab_data, tmp, ensure_ascii=False)
-    tmp.close()
-    vh = VocabHelper(tmp.name)
-    os.unlink(tmp.name)
-    return vh
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -545,18 +539,9 @@ def main():
     vocab = build_vocab_from_data(train_path, orig_vocab, args.cjk_min_freq)
 
     # 把压缩后的 vocab.json 写到 out_dir（推理时需要与 .pt 配套）
-    compressed_vocab_data = {
-        "char2id":  vocab.char2id,
-        "id2char":  {str(v): k for k, v in vocab.char2id.items()},
-        "label2id": vocab.label2id,
-        "id2label": {str(k): v for k, v in vocab.id2label.items()},
-        "special_tokens": ["<PAD>", "<UNK>"],
-        "pad_id":  0,
-        "unk_id":  1,
-        "num_labels": vocab.num_labels,
-    }
+    # to_dict() 是唯一的序列化来源，避免在多处手动拼同样的字典结构
     with open(out_dir / "vocab.json", "w", encoding="utf-8") as f:
-        json.dump(compressed_vocab_data, f, ensure_ascii=False, indent=2)
+        json.dump(vocab.to_dict(), f, ensure_ascii=False, indent=2)
 
     # ── NER 类权重 ───────────────────────────────────────────────────
     ner_class_weights = None

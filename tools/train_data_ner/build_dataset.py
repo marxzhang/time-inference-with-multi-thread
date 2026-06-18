@@ -46,12 +46,13 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).parent))
 
 def parse_args():
     p = argparse.ArgumentParser(description="生成 DateNER 训练数据集")
     p.add_argument("--input",   default="/home/marx/code/AlbumTimeFixSystem/.cache/phase1.jsonl",
                    help="snapshot jsonl 路径")
-    p.add_argument("--out-dir", default="/home/marx/code/AlbumTimeFixSystem/tools/train_data_ner/data",
+    p.add_argument("--out-dir", default="data",
                    help="输出目录")
     p.add_argument("--min-conf", type=float, default=0.85,
                    help="item 最低 confidence，低于此值的 item 不生成正样本（默认 0.85）")

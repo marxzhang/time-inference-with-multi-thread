@@ -345,6 +345,38 @@ class VocabHelper:
     def encode(self, text: str) -> list[int]:
         return [self.char2id.get(c, self.unk_id) for c in text]
 
+    def to_dict(self) -> dict:
+        """
+        序列化为 vocab.json 的标准格式。
+
+        唯一的序列化来源：build_dataset.py / train.py 任何需要写出
+        vocab.json 的地方都应调用此方法，而不是手动拼字典，
+        防止字段定义在多处重复、容易写歪。
+        """
+        return {
+            "char2id":  self.char2id,
+            "id2char":  {str(v): k for k, v in self.char2id.items()},
+            "label2id": self.label2id,
+            "id2label": {str(k): v for k, v in self.id2label.items()},
+            "special_tokens": ["<PAD>", "<UNK>"],
+            "pad_id":  self.pad_id,
+            "unk_id":  self.unk_id,
+            "num_labels": self.num_labels,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "VocabHelper":
+        """从 dict（而非文件路径）构造，避免临时文件往返。"""
+        obj = cls.__new__(cls)
+        obj.char2id    = data["char2id"]
+        obj.id2char    = {int(k): v for k, v in data["id2char"].items()}
+        obj.label2id   = data["label2id"]
+        obj.id2label   = {int(k): v for k, v in data["id2label"].items()}
+        obj.pad_id     = data["pad_id"]
+        obj.unk_id     = data["unk_id"]
+        obj.num_labels = data["num_labels"]
+        return obj
+
     def vocab_size(self) -> int:
         return len(self.char2id)
 
