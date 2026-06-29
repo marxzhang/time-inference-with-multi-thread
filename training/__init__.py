@@ -22,8 +22,7 @@ if TYPE_CHECKING:
 # DateNER 权重的默认路径（相对于项目根目录）
 _DATE_NER_WEIGHTS = Path("weights/date_ner.pt")
 _DATE_NER_VOCAB   = Path("weights/vocab.json")
-# _DATE_NER_WEIGHTS = Path("training/date_ner/weights/date_ner.pt")
-# _DATE_NER_VOCAB   = Path("training/date_ner/weights/vocab.json")
+
 
 class ModelContainer:
     """

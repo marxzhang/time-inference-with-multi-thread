@@ -3,20 +3,20 @@ tools/train_date_ner/train.py
 
 MTL DateNER 训练入口。
 
-用法：
+用法（以包方式运行，项目根目录下执行）：
     # 基本训练
-    python tools/train_date_ner/train.py
+    python -m training.date_ner.train
 
     # 指定路径和超参数
-    python tools/train_date_ner/train.py \
-        --data-dir tools/train_date_ner/data \
+    python -m training.date_ner.train \
+        --data-dir training/date_ner/data \
         --out-dir  weights \
         --epochs   30 \
         --batch-size 256 \
         --lr 1e-3
 
     # 快速验证流程（少量数据跑通）
-    python tools/train_date_ner/train.py --smoke-test
+    python -m training.date_ner.train --smoke-test
 
 训练产物（weights/）：
     date_ner.pt      模型权重 + config（用 load_model() 加载）
@@ -41,9 +41,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
-# 同目录导入
-sys.path.insert(0, str(Path(__file__).parent))
-from model import DateNERModel, ModelConfig, VocabHelper
+# 绝对包导入：要求以 `python -m training.date_ner.train` 方式运行，
+# 此时项目根目录自动加入 sys.path[0]，无需手动 hack。
+from models.date_ner import DateNERModel, ModelConfig, VocabHelper
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ from model import DateNERModel, ModelConfig, VocabHelper
 
 def parse_args():
     p = argparse.ArgumentParser(description="训练 DateNER MTL 模型")
-    p.add_argument("--data-dir",   default="data")
+    p.add_argument("--data-dir",   default="/home/marx/code/AlbumTimeFixSystem/training/date_ner/data")
     p.add_argument("--out-dir",    default="weights")
     p.add_argument("--epochs",     type=int,   default=30)
     p.add_argument("--batch-size", type=int,   default=256)
@@ -691,7 +691,7 @@ def main():
     # smoke-test 快速验证提示
     if args.smoke_test:
         print("\n[smoke-test 完成] 流程跑通，可用全量数据正式训练：")
-        print("  python tools/train_date_ner/train.py")
+        print("  python -m training.date_ner.train")
 
 
 if __name__ == "__main__":

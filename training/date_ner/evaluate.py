@@ -3,12 +3,12 @@ tools/train_date_ner/evaluate.py
 
 在测试集上评估已训练的 DateNER 模型，输出详细指标和错误样本分析。
 
-用法：
-    python tools/train_date_ner/evaluate.py
-    python tools/train_date_ner/evaluate.py \
+用法（以包方式运行，项目根目录下执行）：
+    python -m training.date_ner.evaluate
+    python -m training.date_ner.evaluate \
         --weights weights/date_ner.pt \
         --vocab   weights/vocab.json \
-        --test    tools/train_date_ner/data/test.jsonl \
+        --test    training/date_ner/data/test.jsonl \
         --errors  100        # 打印前 N 条错误样本
         --out     weights/eval_report.json
 """
@@ -25,8 +25,10 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).parent))
-from model import DateNERModel, ModelConfig, VocabHelper, load_model, _decode_bio_spans
+# 绝对包导入：要求以 `python -m training.date_ner.evaluate` 方式运行。
+from models.date_ner import (
+    DateNERModel, ModelConfig, VocabHelper, load_model, _decode_bio_spans,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +39,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="评估 DateNER 模型")
     p.add_argument("--weights",    default="weights/date_ner.pt")
     p.add_argument("--vocab",      default="weights/vocab.json")
-    p.add_argument("--test",       default="/home/marx/code/AlbumTimeFixSystem/tools/train_data_ner/data/test.jsonl")
+    p.add_argument("--test",       default="/home/marx/code/AlbumTimeFixSystem/training/date_ner/data/test.jsonl")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--errors",     type=int, default=30,
                    help="打印多少条错误样本（0=不打印）")

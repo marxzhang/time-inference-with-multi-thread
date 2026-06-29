@@ -46,7 +46,6 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-sys.path.insert(0, str(Path(__file__).parent))
 
 def parse_args():
     p = argparse.ArgumentParser(description="生成 DateNER 训练数据集")

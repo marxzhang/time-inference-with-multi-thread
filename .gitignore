@@ -2,6 +2,6 @@
 weights/
 .cache/
 output/
-tools/train_data_ner/weights/
-tools/train_data_ner/data/
+training/date_ner/weights/
+training/date_ner/data/
 running-parameters.txt

@@ -1,52 +1,19 @@
 """
-tools/train_date_ner/model.py
+models/date_ner.py — DateNER MTL 模型定义 + 推理封装
 
-MTL DateNER 模型：字符级 BiLSTM + 分类头 + NER 头。
+与 models/clip.py 同级、同语义：定义"如何加载和调用这个模型"，
+不包含任何训练逻辑（训练脚本在 training/date_ner/ 下，反向 import 本文件）。
 
-架构：
-    输入字符 ID 序列
-        ↓
-    CharEmbedding  (vocab_size, embed_dim)
-        ↓  dropout
-    BiLSTM         (embed_dim → hidden_dim*2，num_layers 层)
-        ↓
-        ├── max-pooling over time → Linear → clf_logits  [B, 2]
-        └── 每位置 hidden        → Linear → ner_logits   [B, T, num_labels]
-
-推理时使用 predict()，返回：
-    [
-        {
-            "text":       原始文本,
-            "clf_prob":   含时间的概率 (float),
-            "spans": [
-                {
-                    "field":      "YEAR" / "MONTH" / ...,
-                    "start":      字符起始下标,
-                    "end":        字符结束下标（exclusive）,
-                    "value":      对应子串,
-                    "confidence": 该 span 的平均 NER softmax 概率,
-                }
-            ],
-            "datetime_candidates": [   # 由 spans 组合出的候选 datetime
-                {
-                    "datetime": datetime | None,
-                    "fields":   {"year": "2019", "month": "10", ...},
-                    "char_spans": [...],          # 参与组合的 span
-                    "confidence": float,          # clf_prob * span 置信度均值
-                }
-            ],
-        }
-    ]
+架构：字符级 BiLSTM + 分类头 + NER 头。详见 DateNERModel 类文档。
 
 独立测试：
-    python model.py
+    python -m models.date_ner
 """
 
 from __future__ import annotations
 
 import json
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -82,9 +49,15 @@ class DateNERModel(nn.Module):
     """
     字符级 BiLSTM 多任务学习模型。
 
-    参数
-    ----
-    config : ModelConfig
+    架构：
+        输入字符 ID 序列
+            ↓
+        CharEmbedding  (vocab_size, embed_dim)
+            ↓ dropout
+        BiLSTM         (embed_dim → hidden_dim*2，num_layers 层)
+            ↓
+            ├── max-pooling over time → Linear → clf_logits  [B, 2]
+            └── 每位置 hidden        → Linear → ner_logits   [B, T, num_labels]
 
     forward 输入
     -----------
@@ -101,14 +74,12 @@ class DateNERModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # 字符 Embedding
         self.embedding = nn.Embedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.embed_dim,
             padding_idx=config.pad_id,
         )
 
-        # BiLSTM
         self.lstm = nn.LSTM(
             input_size=config.embed_dim,
             hidden_size=config.hidden_dim,
@@ -123,7 +94,6 @@ class DateNERModel(nn.Module):
         self.embed_dropout = nn.Dropout(config.dropout)
         self.lstm_dropout  = nn.Dropout(config.dropout)
 
-        # 分类头：max-pooling → Linear(256, 2)
         self.clf_head = nn.Sequential(
             nn.Linear(lstm_out_dim, lstm_out_dim // 2),
             nn.ReLU(),
@@ -131,14 +101,12 @@ class DateNERModel(nn.Module):
             nn.Linear(lstm_out_dim // 2, 2),
         )
 
-        # NER 头：逐位置 Linear(256, num_labels)
         self.ner_head = nn.Linear(lstm_out_dim, config.num_labels)
 
         self._init_weights()
 
     def _init_weights(self):
         nn.init.xavier_uniform_(self.embedding.weight)
-        # LSTM 权重：正交初始化隐层，Xavier 输入权重
         for name, param in self.lstm.named_parameters():
             if "weight_ih" in name:
                 nn.init.xavier_uniform_(param)
@@ -146,7 +114,6 @@ class DateNERModel(nn.Module):
                 nn.init.orthogonal_(param)
             elif "bias" in name:
                 nn.init.zeros_(param)
-                # forget gate bias 设为 1（缓解梯度消失）
                 n = param.size(0)
                 param.data[n // 4: n // 2].fill_(1.0)
         for layer in self.clf_head:
@@ -162,11 +129,9 @@ class DateNERModel(nn.Module):
         lengths:  torch.Tensor,   # [B]
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        # Embedding + dropout
         x = self.embedding(char_ids)          # [B, T, E]
         x = self.embed_dropout(x)
 
-        # BiLSTM（pack 以忽略 PAD 位置的计算）
         packed = nn.utils.rnn.pack_padded_sequence(
             x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
@@ -176,14 +141,11 @@ class DateNERModel(nn.Module):
         )                                      # [B, T, H*2]
         lstm_out = self.lstm_dropout(lstm_out)
 
-        # ── 分类头：对有效位置做 max-pooling ────────────────────────
-        # 先将 PAD 位置填为极小值，再做 max
         mask = self._length_mask(lengths, lstm_out.size(1))  # [B, T]
         masked = lstm_out.masked_fill(~mask.unsqueeze(-1), float("-inf"))
         pooled = masked.max(dim=1).values      # [B, H*2]
         clf_logits = self.clf_head(pooled)     # [B, 2]
 
-        # ── NER 头：逐位置投影 ───────────────────────────────────────
         ner_logits = self.ner_head(lstm_out)   # [B, T, num_labels]
 
         return clf_logits, ner_logits
@@ -196,7 +158,7 @@ class DateNERModel(nn.Module):
         return idxs < lengths.unsqueeze(1)                          # [B, T]
 
     # -----------------------------------------------------------------------
-    # 损失函数（在 train.py 里调用，也可以直接放这里方便复用）
+    # 损失函数（训练时调用，定义放在这里方便训练脚本直接复用）
     # -----------------------------------------------------------------------
 
     def compute_loss(
@@ -212,13 +174,10 @@ class DateNERModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         联合损失 = clf_weight * L_clf + ner_weight * L_ner
-
         返回 (total_loss, clf_loss, ner_loss)
         """
-        # 分类损失（交叉熵）
         clf_loss = F.cross_entropy(clf_logits, clf_labels)
 
-        # NER 损失（mask 掉 PAD 位置）
         B, T, C = ner_logits.shape
         mask = self._length_mask(lengths, T)          # [B, T]
 
@@ -233,7 +192,6 @@ class DateNERModel(nn.Module):
             reduction="none",
         )                                             # [B*T]
 
-        # 只对有效位置求均值
         ner_loss = (ner_loss_all * mask_flat.float()).sum() / mask_flat.sum().clamp(min=1)
 
         total = clf_weight * clf_loss + ner_weight * ner_loss
@@ -251,26 +209,28 @@ class DateNERModel(nn.Module):
         device: torch.device,
     ) -> list[dict]:
         """
-        对一批文本片段做推理，返回结构化结果。
-
-        参数
-        ----
-        texts  : 原始文本列表（文件名 stem 或文件夹名）
-        vocab  : VocabHelper 实例（封装 char→id 映射和 id→label 映射）
-        device : 推理设备
-
-        返回
-        ----
-        list[dict]，每个元素对应一条文本，格式见模块 docstring。
+        对一批文本片段做推理，返回结构化结果：
+        [
+            {
+                "text":       原始文本,
+                "clf_prob":   含时间的概率 (float),
+                "spans": [
+                    {"field": "YEAR"/"MONTH"/..., "start": int, "end": int,
+                     "value": str, "confidence": float}
+                ],
+                "datetime_candidates": [
+                    {"datetime": str|None, "fields": dict,
+                     "char_spans": [...], "confidence": float}
+                ],
+            }
+        ]
         """
         self.eval()
 
-        # 编码 + padding
         char_ids_list = [vocab.encode(t) for t in texts]
         lengths = torch.tensor([len(ids) for ids in char_ids_list], dtype=torch.long)
         max_len = int(lengths.max())
 
-        # padding
         padded = torch.full((len(texts), max_len), vocab.pad_id, dtype=torch.long)
         for i, ids in enumerate(char_ids_list):
             padded[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
@@ -288,7 +248,6 @@ class DateNERModel(nn.Module):
             L = int(lengths[i])
             clf_prob = clf_probs[i]
 
-            # 快速过滤：分类置信度过低
             if clf_prob < self.config.clf_threshold:
                 results.append({
                     "text":               text,
@@ -298,7 +257,6 @@ class DateNERModel(nn.Module):
                 })
                 continue
 
-            # 解码 NER：贪心取 argmax 标签
             token_probs  = ner_probs[i, :L]                   # [L, C]
             token_labels = token_probs.argmax(dim=-1).tolist() # [L]
             token_confs  = token_probs.max(dim=-1).values.tolist()
@@ -322,18 +280,18 @@ class DateNERModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 词表辅助类（封装 char→id 和 id→label，train.py / infer.py 都用这个）
+# 词表辅助类
 # ---------------------------------------------------------------------------
 
 class VocabHelper:
-    """
-    从 vocab.json 加载，提供编码接口。
-    """
+    """从 vocab.json 加载（或从 dict 构造），提供编码接口。"""
 
     def __init__(self, vocab_path: str | Path):
         with open(vocab_path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        self._load_from_dict(data)
 
+    def _load_from_dict(self, data: dict) -> None:
         self.char2id:  dict[str, int] = data["char2id"]
         self.id2char:  dict[int, str] = {int(k): v for k, v in data["id2char"].items()}
         self.label2id: dict[str, int] = data["label2id"]
@@ -342,6 +300,13 @@ class VocabHelper:
         self.unk_id:   int = data["unk_id"]
         self.num_labels: int = data["num_labels"]
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "VocabHelper":
+        """从 dict（而非文件路径）构造，避免训练时的临时文件往返。"""
+        obj = cls.__new__(cls)
+        obj._load_from_dict(data)
+        return obj
+
     def encode(self, text: str) -> list[int]:
         return [self.char2id.get(c, self.unk_id) for c in text]
 
@@ -349,9 +314,8 @@ class VocabHelper:
         """
         序列化为 vocab.json 的标准格式。
 
-        唯一的序列化来源：build_dataset.py / train.py 任何需要写出
-        vocab.json 的地方都应调用此方法，而不是手动拼字典，
-        防止字段定义在多处重复、容易写歪。
+        唯一的序列化来源：任何需要写出 vocab.json 的地方都应调用此方法，
+        而不是手动拼字典，防止字段定义在多处重复、容易写歪。
         """
         return {
             "char2id":  self.char2id,
@@ -363,19 +327,6 @@ class VocabHelper:
             "unk_id":  self.unk_id,
             "num_labels": self.num_labels,
         }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "VocabHelper":
-        """从 dict（而非文件路径）构造，避免临时文件往返。"""
-        obj = cls.__new__(cls)
-        obj.char2id    = data["char2id"]
-        obj.id2char    = {int(k): v for k, v in data["id2char"].items()}
-        obj.label2id   = data["label2id"]
-        obj.id2label   = {int(k): v for k, v in data["id2label"].items()}
-        obj.pad_id     = data["pad_id"]
-        obj.unk_id     = data["unk_id"]
-        obj.num_labels = data["num_labels"]
-        return obj
 
     def vocab_size(self) -> int:
         return len(self.char2id)
@@ -395,10 +346,10 @@ def _decode_bio_spans(
     """
     将 BIO 标签序列转换为 span 列表。
 
-    处理规则：
+    规则：
         - 遇到 B-XXX 开启新 span
-        - 遇到 I-XXX 且与当前 span 字段一致 → 延伸
-        - 遇到 I-XXX 但与当前 span 字段不一致 → 视为新 B（容错）
+        - 遇到 I-XXX 且字段一致 → 延伸
+        - 遇到 I-XXX 但字段不一致 → 视为新 B（容错）
         - 遇到 O 或 B-新字段 → 关闭当前 span
         - span 平均置信度 < threshold → 丢弃
     """
@@ -427,19 +378,16 @@ def _decode_bio_spans(
 
         if label == "O":
             _close_span(pos)
-
         elif label.startswith("B-"):
             _close_span(pos)
-            cur_field = label[2:]   # 去掉 "B-"
+            cur_field = label[2:]
             cur_start = pos
             cur_confs = [conf]
-
         elif label.startswith("I-"):
             field = label[2:]
             if field == cur_field:
                 cur_confs.append(conf)
             else:
-                # I-XXX 字段与当前不一致，视为错误的 B-XXX
                 _close_span(pos)
                 cur_field = field
                 cur_start = pos
@@ -453,7 +401,6 @@ def _decode_bio_spans(
 # 后处理：spans → datetime 候选
 # ---------------------------------------------------------------------------
 
-# 时间字段的层级顺序（从高到低精度）
 _FIELD_ORDER = ["YEAR", "MONTH", "DAY", "HOUR", "MIN", "SEC"]
 
 def _build_datetime_candidates(
@@ -463,21 +410,19 @@ def _build_datetime_candidates(
     """
     从解码出的 spans 组合出 datetime 候选。
 
-    当前策略：将所有 spans 视为一个候选（一个文本片段里不会有两套日期）。
-    若 spans 里字段不完整（如只有 YEAR），生成部分日期候选（datetime 字段为 None，
-    但 fields 里有具体值，交由 ResolverStage 进一步处理）。
+    当前策略：所有 spans 视为一个候选（一个文本片段不会有两套日期）。
+    字段不完整时（如只有 YEAR）仍生成候选，datetime 字段为 None，
+    但 fields 里有具体值，交由 ResolverStage 进一步处理。
     """
     if not spans:
         return []
 
-    # 按字段分组，同一字段取置信度最高的 span
     field_map: dict[str, dict] = {}
     for span in spans:
         f = span["field"]
         if f not in field_map or span["confidence"] > field_map[f]["confidence"]:
             field_map[f] = span
 
-    # 提取数值
     fields_vals: dict[str, str] = {}
     for f in _FIELD_ORDER:
         if f in field_map:
@@ -486,7 +431,6 @@ def _build_datetime_candidates(
     if not fields_vals:
         return []
 
-    # 尝试组合 datetime
     dt: Optional[datetime] = None
     try:
         year  = int(fields_vals.get("YEAR",  "0") or "0")
@@ -500,7 +444,6 @@ def _build_datetime_candidates(
     except (ValueError, OverflowError):
         pass
 
-    # 候选置信度 = clf_prob * span 置信度均值
     span_conf_mean = (
         sum(s["confidence"] for s in field_map.values()) / len(field_map)
     )
@@ -529,10 +472,7 @@ def load_model(
     加载已训练模型，返回 (model, vocab)。
 
     weights_path 对应的 .pt 文件格式：
-        {
-            "model_state": state_dict,
-            "config":      ModelConfig 的 __dict__,
-        }
+        {"model_state": state_dict, "config": ModelConfig 的 __dict__}
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -549,15 +489,15 @@ def load_model(
 
 
 # ---------------------------------------------------------------------------
-# 独立测试（python model.py）
+# 独立测试（python -m models.date_ner）
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import os
+    import tempfile
 
     print("=== DateNERModel 独立测试 ===\n")
 
-    # ── 构造最小词表 ─────────────────────────────────────────────────
     chars = (
         list("0123456789")
         + list("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
@@ -578,7 +518,6 @@ if __name__ == "__main__":
     label2id = {l: i for i, l in enumerate(LABELS)}
     id2label  = {i: l for i, l in enumerate(LABELS)}
 
-    import tempfile
     vocab_data = {
         "char2id":  char2id,
         "id2char":  {str(v): k for k, v in char2id.items()},
@@ -589,17 +528,9 @@ if __name__ == "__main__":
         "unk_id":  1,
         "num_labels": len(LABELS),
     }
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(vocab_data, f, ensure_ascii=False)
-        vocab_path = f.name
+    vocab = VocabHelper.from_dict(vocab_data)
 
-    vocab = VocabHelper(vocab_path)
-
-    # ── 构造模型 ─────────────────────────────────────────────────────
-    config = ModelConfig(
-        vocab_size=vocab.vocab_size(),
-        num_labels=vocab.num_labels,
-    )
+    config = ModelConfig(vocab_size=vocab.vocab_size(), num_labels=vocab.num_labels)
     model = DateNERModel(config)
     device = torch.device("cpu")
     model.to(device)
@@ -609,7 +540,6 @@ if __name__ == "__main__":
     print(f"词表大小:   {vocab.vocab_size()}")
     print(f"标签数量:   {vocab.num_labels}\n")
 
-    # ── 前向传播测试 ─────────────────────────────────────────────────
     texts = [
         "IMG_20191002_105038",
         "2021-04-23 155835",
@@ -618,39 +548,6 @@ if __name__ == "__main__":
         "PIC_20130916_142420_E34",
     ]
 
-    print("── forward pass ──")
-    ids_list = [vocab.encode(t) for t in texts]
-    lengths  = torch.tensor([len(ids) for ids in ids_list])
-    max_len  = int(lengths.max())
-    padded   = torch.full((len(texts), max_len), vocab.pad_id, dtype=torch.long)
-    for i, ids in enumerate(ids_list):
-        padded[i, :len(ids)] = torch.tensor(ids)
-
-    with torch.no_grad():
-        clf_logits, ner_logits = model(padded, lengths)
-
-    print(f"clf_logits shape: {clf_logits.shape}")   # [5, 2]
-    print(f"ner_logits shape: {ner_logits.shape}\n") # [5, max_len, 13]
-
-    # ── 损失计算测试 ─────────────────────────────────────────────────
-    print("── loss 计算 ──")
-    clf_labels = torch.tensor([1, 1, 0, 1, 1])
-    ner_labels = torch.zeros(len(texts), max_len, dtype=torch.long)  # 全 O
-
-    # 模拟给第0条打标
-    # IMG_20191002_105038：YEAR 在 4-7，MONTH 在 8-9，DAY 在 10-11
-    for pos in range(4, 8):
-        ner_labels[0, pos] = label2id["I-YEAR"] if pos > 4 else label2id["B-YEAR"]
-    ner_labels[0, 4] = label2id["B-YEAR"]
-
-    total_loss, clf_loss, ner_loss = model.compute_loss(
-        clf_logits, ner_logits, clf_labels, ner_labels, lengths
-    )
-    print(f"total_loss: {total_loss.item():.4f}")
-    print(f"clf_loss  : {clf_loss.item():.4f}")
-    print(f"ner_loss  : {ner_loss.item():.4f}\n")
-
-    # ── predict 接口测试 ─────────────────────────────────────────────
     print("── predict 接口 ──")
     results = model.predict(texts, vocab, device)
     for r in results:
@@ -661,24 +558,4 @@ if __name__ == "__main__":
             print(f"    dt_cand  : {r['datetime_candidates'][0]['datetime']}")
         print()
 
-    # ── 梯度流动检查 ─────────────────────────────────────────────────
-    print("── 梯度检查 ──")
-    model.train()
-    total_loss, _, _ = model.compute_loss(
-        *model(padded, lengths),
-        clf_labels, ner_labels, lengths,
-    )
-    total_loss.backward()
-    grad_norms = {
-        name: p.grad.norm().item()
-        for name, p in model.named_parameters()
-        if p.grad is not None
-    }
-    all_have_grad = all(v > 0 for v in grad_norms.values())
-    print(f"所有参数均有非零梯度: {all_have_grad}")
-    for name, norm in list(grad_norms.items())[:5]:
-        print(f"  {name}: grad_norm={norm:.6f}")
-    print("  ...")
-
-    os.unlink(vocab_path)
-    print("\n✓ 所有测试通过")
+    print("✓ 测试通过")
